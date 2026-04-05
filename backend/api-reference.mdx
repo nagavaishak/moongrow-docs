@@ -348,15 +348,28 @@ EURC → EUR off-ramp for budtenders. Validates requested amount against confirm
 
 ### POST /api/budtender/notifications/register-device
 
-Registers a Web Push token for the authenticated budtender.
+Registers a Web Push subscription (VAPID) for the authenticated budtender. The `pushToken` field is the JSON-serialised `PushSubscription` from the browser's `PushManager.subscribe()` call. Stored on `User.pushToken`.
 
 ```json
-{ "pushToken": "..." }
+{ "pushToken": "{\"endpoint\":\"https://fcm.googleapis.com/...\",\"keys\":{...}}" }
 ```
+
+### DELETE /api/budtender/notifications/register-device
+
+Clears the authenticated budtender's push token (unsubscribe).
 
 ### GET /api/budtender/notifications
 
 Returns the notification history feed for the authenticated budtender.
+
+**Push notification triggers** (server-side, fire-and-forget):
+
+| Event | Trigger point |
+|---|---|
+| `commission_settled` | Helius webhook confirms payout |
+| `bonus_won` | Bonus lifecycle worker settles a completed competition |
+| `bonus_activated` | Bonus lifecycle worker transitions SCHEDULED → ACTIVE |
+| `leaderboard_change` | Available via `notifyLeaderboardChange()` — wired for future use |
 
 ---
 
@@ -389,6 +402,44 @@ Sets `Store.isFrozen = true`. New sale events are saved as `SKIPPED`.
 ### PUT /api/admin/stores/:id/unfreeze
 
 Clears the freeze.
+
+### GET /api/admin/retailers
+
+Paginated retailer list. Filterable by `status` (active/frozen/inactive) and `tier` (basic/pro/enterprise). Returns store details with campaign and membership counts.
+
+### POST /api/admin/retailers
+
+Manually onboard a new retailer. Creates a `User` record (or finds by email) and a `Store` with OWNER `StoreMembership`.
+
+```json
+{
+  "name": "Boerejongens",
+  "ownerEmail": "owner@boerejongens.nl",
+  "ownerWallet": "4xK3...",
+  "locale": "nl",
+  "subscriptionTier": "basic"
+}
+```
+
+### GET /api/admin/retailers/:id
+
+Full retailer detail: store info, all memberships, campaigns, POS integration status, sale event count.
+
+### PUT /api/admin/retailers/:id
+
+Edit store `name`, `address`, `locale`, `subscriptionTier`, `subscriptionStatus`.
+
+### POST /api/admin/retailers/:id/suspend
+
+Sets `isActive = false`, `isFrozen = true`. Writes an audit log entry.
+
+### POST /api/admin/retailers/:id/reactivate
+
+Sets `isActive = true`, `isFrozen = false`. Writes an audit log entry.
+
+### PUT /api/admin/retailers/:id/subscription
+
+Updates `subscriptionTier` and `subscriptionStatus` independently of other fields.
 
 ### GET /api/admin/payouts
 
