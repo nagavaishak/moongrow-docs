@@ -1,0 +1,502 @@
+---
+title: "API Reference"
+description: "All HTTP endpoints exposed by the Moongrow Express API"
+---
+
+Base URL: `http://localhost:3100` (local) / `https://moongrow-api-production.up.railway.app` (production)
+
+Auth: all routes except `GET /api/health`, `POST /api/pos/events`, and `POST /api/webhooks/*` require a Privy JWT in the `Authorization: Bearer <token>` header.
+
+---
+
+## Health
+
+### GET /api/health
+
+Returns Postgres and Redis connectivity status. Used by Railway health checks.
+
+```json
+{ "status": "ok", "postgres": "up", "redis": "up" }
+```
+
+---
+
+## POS Events
+
+### POST /api/pos/events
+
+Ingests a sale event from the EB POS system. Validates API key, HMAC signature, and timestamp before processing.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `x-api-key` | Yes | Store POS API key (`sk_live_...`) |
+| `x-hmac-signature` | Yes | `sha256={hex}` HMAC over `{timestamp}.{body}` |
+| `x-timestamp` | Yes | Unix timestamp (seconds). Rejected if >60s old. |
+
+**Request body**
+```json
+{
+  "posTransactionId": "eb-txn-0042",
+  "storeExternalId": "coffeeshop-amsterdam-1",
+  "staffId": "staff-007",
+  "timestamp": "2026-03-16T14:32:00Z",
+  "lineItems": [
+    { "sku": "HASH-PK-1G", "quantity": 2, "unitPriceEur": "8.50" }
+  ]
+}
+```
+
+**Responses**
+
+| Status | Meaning |
+|---|---|
+| `200` | Accepted |
+| `400` | Schema validation failed or timestamp too old |
+| `401` | Invalid API key or HMAC signature |
+| `409` | Duplicate transaction |
+| `500` | Internal error |
+
+---
+
+## Stores
+
+All store routes require `RETAILER` role unless noted.
+
+### POST /api/stores
+
+Creates a store. The caller's connected wallet becomes `ownerWallet`.
+
+### GET /api/stores/:id
+
+Returns store details including member list and cached vault balance.
+
+### PUT /api/stores/:id
+
+Updates store `name`, `address`, or `locale`. Caller must be OWNER.
+
+### POST /api/stores/:id/invites
+
+Generates a single-use invite token. Token shown once — not retrievable after creation.
+
+```json
+{ "role": "BUDTENDER", "expiresInHours": 168 }
+```
+
+### GET /api/stores/:id/invites
+
+Lists all pending (unused, non-expired) invites.
+
+### POST /api/stores/:id/members/join
+
+Budtender redeems an invite token to join the store.
+
+```json
+{ "token": "abc123..." }
+```
+
+### PUT /api/stores/:id/members/:memberId/approve
+
+Re-activates a deactivated membership.
+
+### PUT /api/stores/:id/members/:memberId/remove
+
+Deactivates a membership. Cannot remove the store owner.
+
+### GET /api/stores/:id/skus
+
+Lists all SKUs in the store catalog. Query `?active=false` to include inactive SKUs.
+
+### POST /api/stores/:id/skus
+
+Creates a new SKU.
+
+### PUT /api/stores/:id/skus/:skuId
+
+Updates a SKU's name, category, basePrice, or isActive.
+
+### DELETE /api/stores/:id/skus/:skuId
+
+Soft-deletes a SKU. Blocked with `409` if an active campaign references the SKU.
+
+---
+
+## Wallet
+
+All wallet routes require `RETAILER` role.
+
+### GET /api/stores/:id/wallet
+
+Returns the store's full wallet balance breakdown. Also returns `lowBalanceWarning: true` when available balance falls below the configured threshold.
+
+```json
+{
+  "total": 500.00,
+  "committedCampaigns": 120.00,
+  "committedBonuses": 75.00,
+  "available": 305.00,
+  "lowBalanceWarning": false
+}
+```
+
+`committedCampaigns` and `committedBonuses` are calculated live — not stored.
+
+### GET /api/stores/:id/wallet/transactions
+
+Paginated `WalletTransaction` ledger, most recent first. Query: `?page=&limit=`.
+
+Each entry includes a human-readable label: commission rows show SKU name, bonus rows show bonus name, top-ups show Confirmo reference.
+
+### PUT /api/stores/:id/wallet/warning-threshold
+
+Updates `Store.lowBalanceThresholdPct`.
+
+```json
+{ "thresholdPct": 25 }
+```
+
+### POST /api/stores/:id/wallet/withdraw
+
+Initiates a EURC → EUR off-ramp via Confirmo. Deducts the amount from available balance immediately. Writes a `WITHDRAWAL` `WalletTransaction`. Status updates arrive via the Confirmo payout webhook.
+
+```json
+{
+  "amountEurc": 100.00,
+  "iban": "NL91ABNA0417164300",
+  "beneficiaryName": "Jan de Vries"
+}
+```
+
+<Note>
+  IBAN is stripped of whitespace and validated server-side. The actual IBAN is never stored — only a masked version (e.g. `NL91****4300`) is written to `WalletTransaction.withdrawalIban`.
+</Note>
+
+### GET /api/stores/:id/onboarding-status
+
+Returns the store's onboarding progress.
+
+```json
+{ "onboardingStep": 3, "onboardingComplete": false, "totalSteps": 6 }
+```
+
+### POST /api/stores/:id/onboarding/complete-step
+
+Advances `Store.onboardingStep` by 1. Sets `onboardingComplete = true` on step 6.
+
+---
+
+## Campaigns
+
+All campaign routes require `RETAILER` role.
+
+### GET /api/campaigns?storeId=
+
+Returns all campaigns for a store, including their rules with SKU details.
+
+### POST /api/campaigns
+
+Creates a new campaign. Returns `409` if any rule's SKU already has an active campaign.
+
+```json
+{
+  "storeId": "store_abc",
+  "name": "Summer Push",
+  "budgetEurc": 200,
+  "startsAt": "2026-04-01T00:00:00Z",
+  "endsAt": "2026-04-30T23:59:59Z",
+  "rules": [
+    { "skuId": "sku_123", "commissionType": "PERCENTAGE", "commissionValue": 0.05 }
+  ]
+}
+```
+
+### POST /api/campaigns/:id/pause
+
+Sets `ACTIVE` → `PAUSED_MANUAL`. Only the store owner can call this.
+
+### POST /api/campaigns/:id/resume
+
+Sets `PAUSED_MANUAL` → `ACTIVE`. Returns `409` if the campaign is in `PAUSED_SYSTEM` state — system-paused campaigns only resume via the Confirmo top-up webhook.
+
+---
+
+## Bonuses
+
+All bonus routes require `RETAILER` role.
+
+### GET /api/bonuses?storeId=
+
+Lists all bonuses for a store. Query `?status=ACTIVE` to filter by status.
+
+### POST /api/bonuses
+
+Creates a new bonus. Earmarks `budgetTotal` from available balance immediately. Returns `400` if available balance is insufficient.
+
+```json
+{
+  "storeId": "store_abc",
+  "name": "Top Seller Week 17",
+  "type": "RANKED",
+  "metric": "COMMISSION_AMOUNT",
+  "scope": "STORE",
+  "startsAt": "2026-04-07T00:00:00Z",
+  "endsAt": "2026-04-13T23:59:59Z",
+  "budgetTotal": 150,
+  "tieRule": "SPLIT",
+  "prizeStructure": [
+    { "position": 1, "amount": 100 },
+    { "position": 2, "amount": 50 }
+  ]
+}
+```
+
+Status is set to `SCHEDULED` if `startsAt` is in the future, otherwise `ACTIVE`.
+
+### GET /api/bonuses/:id
+
+Returns bonus detail including live leaderboard snapshot.
+
+### PUT /api/bonuses/:id
+
+Edits a `SCHEDULED` bonus only. Re-earmarks budget if `budgetTotal` changes.
+
+### DELETE /api/bonuses/:id
+
+Cancels a bonus and releases the full `budgetTotal` back to available balance.
+
+### GET /api/bonuses/:id/leaderboard
+
+Returns live competition rankings.
+
+```json
+{
+  "entries": [
+    { "rank": 1, "userId": "...", "displayName": "Maya", "value": 24.50, "gap": 0 },
+    { "rank": 2, "userId": "...", "displayName": "Tom",  "value": 18.00, "gap": 6.50 }
+  ]
+}
+```
+
+---
+
+## Leaderboard
+
+### GET /api/stores/:id/leaderboard?period=&metric=
+
+Retailer view — full ranked staff list. Filterable by `period` (`7d`, `30d`, `all`) and `metric` (`commission` or `units`).
+
+---
+
+## Budtender
+
+All budtender routes require `BUDTENDER` role.
+
+### GET /api/budtender/earnings
+
+Payout history for the authenticated budtender, paginated.
+
+**Query params:** `storeId`, `page`, `limit` (max 100)
+
+```json
+{
+  "data": [
+    {
+      "id": "...",
+      "amountEurc": "0.97",
+      "status": "CONFIRMED",
+      "isBonus": false,
+      "saleEvent": { "store": { "name": "Dampkring" }, "lineItems": [{ "skuName": "Hash Pre-Roll 1g" }] }
+    }
+  ],
+  "total": 42
+}
+```
+
+### GET /api/budtender/incentives?storeId=
+
+Lists active campaigns (with commission rates) at the budtender's store.
+
+### GET /api/budtender/leaderboard?storeId=&period=
+
+If an active `Bonus` exists for the store: returns the competition leaderboard with name, prize structure, `endsAt`, `userRank`, and `userGap`.
+
+If no active bonus: returns the default weekly leaderboard with week date range, `daysRemaining`, `userRank`, and `userGap`.
+
+```json
+{
+  "type": "bonus",
+  "bonusName": "Top Seller Week 17",
+  "endsAt": "2026-04-13T23:59:59Z",
+  "prizeStructure": [{ "rank": 1, "amountEurc": 100 }],
+  "userRank": 2,
+  "userGap": 6.50,
+  "scope": "STORE",
+  "entries": [
+    { "rank": 1, "userId": "...", "displayName": "Maya", "totalEarnedEurc": 24.50, "totalSales": 18 }
+  ]
+}
+```
+
+### POST /api/budtender/wallet/withdraw
+
+EURC → EUR off-ramp for budtenders. Validates requested amount against confirmed earnings balance.
+
+```json
+{ "amountEurc": 50.00, "iban": "NL91ABNA0417164300", "beneficiaryName": "Jan de Vries" }
+```
+
+### POST /api/budtender/notifications/register-device
+
+Registers a Web Push token for the authenticated budtender.
+
+```json
+{ "pushToken": "..." }
+```
+
+### GET /api/budtender/notifications
+
+Returns the notification history feed for the authenticated budtender.
+
+---
+
+## Real-Time (SSE)
+
+See [Real-Time SSE](/backend/realtime-sse) for full documentation.
+
+### GET /api/realtime/store/:storeId
+
+SSE stream for the retailer dashboard. Events: `wallet_update`, `leaderboard_update`, `campaign_status`, `bonus_update`.
+
+### GET /api/realtime/budtender
+
+SSE stream for the budtender app. Auth via `?token=` query param. Events: `commission_settled`, `leaderboard_update`, `campaign_status`.
+
+---
+
+## Admin
+
+All admin routes require `ADMIN` role.
+
+### GET /api/admin/stores
+
+Lists all stores with counts. Filterable by `frozen` state.
+
+### PUT /api/admin/stores/:id/freeze
+
+Sets `Store.isFrozen = true`. New sale events are saved as `SKIPPED`.
+
+### PUT /api/admin/stores/:id/unfreeze
+
+Clears the freeze.
+
+### GET /api/admin/payouts
+
+Transaction explorer — all payout records, filterable by `storeId`, `status`, `from`, `to`, `page`, `limit`.
+
+### GET /api/admin/kpis
+
+MVP investor KPI metrics.
+
+```json
+{
+  "totalRetailers": 12,
+  "activeRetailers": 9,
+  "totalBudtenders": 87,
+  "totalCommissionEurc": 14250.00,
+  "commissionThisMonth": 3400.00,
+  "activeCampaigns": 23,
+  "avgCampaignsPerRetailer": 2.6,
+  "churnRate": 0.08
+}
+```
+
+### GET /api/admin/billing
+
+Subscription list + MRR summary.
+
+### PUT /api/admin/billing/:retailerId
+
+Changes subscription tier or marks payment received.
+
+```json
+{ "subscriptionTier": "pro", "subscriptionStatus": "active" }
+```
+
+### GET /api/admin/onboarding-pipeline
+
+All retailers with onboarding progress, last active date, and days stuck on current step.
+
+### POST /api/admin/onboarding-pipeline/:id/assist
+
+Marks a retailer as manually assisted. Writes an `AuditLog` entry.
+
+```json
+{ "notes": "Called retailer — helped with SKU import" }
+```
+
+### GET /api/admin/blockchain/health
+
+Settlement health stats: overall success rate, active failures, average settlement time, volume totals.
+
+### POST /api/admin/blockchain/settlements/:id/retry
+
+Re-queues a `FAILED` `PayoutRecord` for retry.
+
+### GET /api/admin/sol-float
+
+SOL float wallet info. Upserts `SolFloatWallet` on first call using `SOL_FLOAT_WALLET_ADDRESS` env var.
+
+```json
+{ "address": "...", "balance": 1.425, "threshold": 0.5, "status": "healthy" }
+```
+
+`status`: `healthy` (balance > threshold), `low` (balance ≤ threshold), `critical` (balance < threshold / 2).
+
+### PUT /api/admin/sol-float/threshold
+
+```json
+{ "threshold": 0.5 }
+```
+
+### GET /api/admin/sol-float/stats
+
+Today / week / all-time SOL fee totals from `SolFeeTransaction` records.
+
+### GET /api/admin/sol-float/transactions
+
+Paginated `SolFeeTransaction` history.
+
+### GET /api/admin/support
+
+All support tickets. Query `?status=OPEN` to filter.
+
+### GET /api/admin/support/:id
+
+Ticket detail.
+
+### PUT /api/admin/support/:id
+
+Update ticket status, assignee, or internal notes.
+
+```json
+{ "status": "IN_PROGRESS", "assignedTo": "admin_user_id", "notes": "Investigating payout tx" }
+```
+
+---
+
+## Webhooks
+
+### POST /api/webhooks/helius
+
+Receives transaction confirmation events from Helius. Protected by `Authorization` header matched against `HELIUS_WEBHOOK_SECRET`. Always returns `200` after auth — Helius retries on non-200.
+
+Updates `PayoutRecord` and `SaleEvent` to `CONFIRMED` or `FAILED`. Emits SSE `commission_settled` and `wallet_update` events.
+
+### POST /api/webhooks/confirmo
+
+Confirmo on-ramp (top-up) callback. Validates `CONFIRMO_CALLBACK_PASSWORD`. On confirmation: updates `Store.vaultEurc`, writes `TOP_UP` `WalletTransaction`, auto-resumes any `PAUSED_SYSTEM` campaigns.
+
+### POST /api/webhooks/confirmo-payout
+
+Confirmo off-ramp (withdrawal) callback. Updates `WalletTransaction.withdrawalStatus` based on payout state.

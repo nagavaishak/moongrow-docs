@@ -1,0 +1,104 @@
+---
+title: "POS Ingestion"
+description: "How Moongrow receives and validates sale events from the EB POS system"
+---
+
+The POS ingestion endpoint is the trust boundary where the physical world meets the blockchain. Every sale that results in a payout starts here.
+
+## Endpoint
+
+```
+POST /api/pos/events
+```
+
+## Authentication
+
+Two independent mechanisms protect every request.
+
+### API key
+
+Each store has one or more `PosApiKey` records. The raw key is never stored — only a hash. The API resolves the key on every request using constant-time comparison.
+
+```http
+x-api-key: sk_live_abc123xyz
+```
+
+### HMAC-SHA256 signature
+
+The EB POS system signs each request body using the per-store `signingSecret`. This proves the request was not tampered with in transit.
+
+```http
+x-hmac-signature: sha256=a1b2c3...
+x-timestamp: 1710000000
+```
+
+The signature covers `{timestamp}.{rawBody}`. The API rejects any signature that doesn't match.
+
+### Replay protection
+
+The `x-timestamp` header is compared to the server clock. Requests older than 60 seconds (`POS_REPLAY_WINDOW_SECONDS = 60`) are rejected with `400`.
+
+This window prevents an attacker who captures a valid signed request from replaying it later.
+
+## Request body
+
+```json
+{
+  "posTransactionId": "eb-txn-0042",
+  "storeExternalId": "coffeeshop-amsterdam-1",
+  "staffId": "staff-007",
+  "timestamp": "2026-03-16T14:32:00Z",
+  "lineItems": [
+    {
+      "sku": "HASH-PK-1G",
+      "quantity": 2,
+      "unitPriceEur": "8.50"
+    },
+    {
+      "sku": "WEED-STD-3G",
+      "quantity": 1,
+      "unitPriceEur": "22.00"
+    }
+  ]
+}
+```
+
+The schema is validated with Zod (`PosWebhookSchema` from `@moongrow/shared`).
+
+## Processing pipeline
+
+```
+1. Validate API key → resolve Store
+2. Verify HMAC signature
+3. Check timestamp (replay guard)
+4. Zod schema validation
+5. Deduplicate: check (storeId, posTransactionId) — return 200 if already processed
+6. Resolve budtender: match staffId against StoreMembership.posStaffRef
+7. Campaign resolution (see Campaign Engine)
+8. Atomic DB write: SaleEvent + SaleEventLineItems + PayoutRecord
+9. Enqueue BullMQ payout job
+10. Return 200
+```
+
+## Deduplication
+
+The `(storeId, posTransactionId)` pair has a unique constraint in Postgres. If the same transaction ID is received twice, the second request is silently accepted with `200` — the POS system should not be penalised for retrying.
+
+## Unknown budtender
+
+If `staffId` from the POS does not match any `StoreMembership.posStaffRef` for the store:
+
+- `SaleEvent` is saved with `status = SKIPPED`, `budtenderUserId = null`
+- No payout is created
+- The retailer receives an alert to map the staff ID to a Moongrow user
+
+The sale data is never lost. Once the retailer adds the mapping, future sales from the same staff member will process normally. (Historical missed payouts are not retroactively applied — this is a pilot limitation.)
+
+## Validation errors
+
+| Error | HTTP status | Cause |
+|---|---|---|
+| Missing / invalid API key | 401 | Key not found or revoked |
+| Invalid HMAC signature | 401 | Request tampered or wrong secret |
+| Timestamp too old | 400 | Replay window exceeded |
+| Schema validation failed | 400 | Missing fields or wrong types |

@@ -1,0 +1,77 @@
+---
+title: "Architecture overview"
+description: "How Moongrow connects a coffeeshop POS to instant Solana payouts"
+---
+
+Moongrow is a Turborepo monorepo with four distinct layers: three Next.js frontends, an Express API backend, a PostgreSQL database, and an Anchor smart contract on Solana.
+
+## System diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         FRONTENDS                           │
+│  retailer (3000)   budtender (3001)   admin (3002)          │
+│  Next.js 15        Next.js 15 PWA     Next.js 15            │
+│  Privy BYOW        Privy embedded     Privy embedded         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ REST
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      API (port 3100)                        │
+│  Express + TypeScript                                       │
+│  POS ingestion · Campaign engine · Payout orchestration     │
+└──────┬────────────────────────────────────────┬─────────────┘
+       │ Prisma                                 │ BullMQ
+       ▼                                        ▼
+┌─────────────┐                       ┌─────────────────────┐
+│  PostgreSQL │                       │  Redis              │
+│  18 models  │                       │  Payout job queue   │
+└─────────────┘                       └──────────┬──────────┘
+                                                 │ Anchor RPC
+                                                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Solana (devnet / mainnet-beta)                 │
+│  Program: Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK    │
+│  EURC vault PDA per store · PayoutRecord per sale           │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ tx confirmation webhook
+                           ▼
+                      Helius RPC
+```
+
+## Monorepo structure
+
+```
+moongrow/
+├── apps/
+│   ├── retailer/     # coffeeshop owner dashboard
+│   ├── budtender/    # staff mobile PWA
+│   └── admin/        # Moongrow internal ops
+├── packages/
+│   ├── api/          # Express server — POS, campaigns, payout queue
+│   ├── db/           # Prisma schema + client
+│   └── shared/       # types, Zod validators, constants
+└── programs/
+    └── moongrow/     # Anchor (Rust) — vault + payout instructions
+```
+
+**Package names:** `@moongrow/retailer`, `@moongrow/budtender`, `@moongrow/admin`, `@moongrow/api`, `@moongrow/db`, `@moongrow/shared`
+
+## Key design principles
+
+**Non-custodial vaults.** Each store's EURC is held in a PDA controlled by the Anchor program, not Moongrow's wallet. Retailers can withdraw at any time.
+
+**Immutable sale log.** `SaleEvent` records are append-only. Campaign rates are snapshotted at ingestion — edits to campaigns never affect in-flight sales.
+
+**Physical double-pay prevention.** The `PayoutRecord` PDA is seeded by `sale_event_id`. A second `execute_payout` call for the same sale fails with a Solana account collision error before any logic runs.
+
+**Queue-based resilience.** BullMQ handles retries with exponential backoff. If a vault is empty, the payout job retries automatically when funds are added.
+
+<CardGroup cols={2}>
+  <Card title="Tech Stack" icon="layer-group" href="/architecture/tech-stack">
+    Full list of frameworks and services
+  </Card>
+  <Card title="Data Flow" icon="arrow-right-arrow-left" href="/architecture/data-flow">
+    Step-by-step walk through a sale event
+  </Card>
+</CardGroup>

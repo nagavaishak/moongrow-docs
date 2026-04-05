@@ -1,0 +1,260 @@
+---
+title: "Alerts & Monitoring"
+description: "Slack alerting and the Helius webhook handler that drives payout confirmation."
+---
+
+## Overview
+
+Moongrow uses two monitoring mechanisms:
+
+1. **Helius webhook** — confirms or fails each payout transaction after it lands on-chain.
+2. **Slack alerts** — fires for failures, warnings, and important operator actions.
+
+If `SLACK_WEBHOOK_URL` is not set, all alerts fall back to `console.log`. The app never crashes due to a missing Slack configuration.
+
+---
+
+## Helius Webhook
+
+### Endpoint
+
+```
+POST /api/webhooks/helius
+```
+
+No Privy auth. Authenticated via the `Authorization` header matched against `HELIUS_WEBHOOK_SECRET`.
+
+### How it works
+
+After the payout worker submits a transaction to Solana, Helius watches the signature and fires this endpoint when it settles.
+
+```
+SUBMITTED ──(tx confirmed)──▶ CONFIRMED  (confirmedAt set)
+SUBMITTED ──(tx failed)─────▶ FAILED     (failureReason set, Slack alert fired)
+```
+
+The endpoint always returns `200` after auth passes. Helius retries on any non-200 response, so we must not return 5xx for our own processing errors — those are logged internally.
+
+### Payload
+
+Helius sends an array of [Enhanced Transaction](https://docs.helius.dev/webhooks-and-websockets/enhanced-transactions-api) objects:
+
+```json
+[
+  {
+    "signature": "5MNe...",
+    "transactionError": null,
+    "type": "UNKNOWN",
+    "slot": 123456,
+    "timestamp": 1678901234
+  }
+]
+```
+
+| Field | Description |
+|---|---|
+| `signature` | Solana transaction hash — matched against `PayoutRecord.txHash` |
+| `transactionError` | `null` if confirmed; error object/string if failed on-chain |
+
+### Current devnet configuration
+
+| Field | Value |
+|---|---|
+| Helius webhook ID | `83244c73-2023-454a-be5d-490488a4651a` |
+| Network | devnet |
+| Webhook type | enhanced |
+| Transaction type | Any |
+| Account address watched | `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK` (Moongrow program) |
+| Auth secret | Set in `.env` as `HELIUS_WEBHOOK_SECRET` |
+
+### Webhook URL
+
+During local development, expose the API with ngrok and paste the resulting URL into the Helius dashboard:
+
+```bash
+ngrok http 3100
+# copy the Forwarding HTTPS URL → append /api/webhooks/helius → paste into Helius dashboard
+```
+
+<Warning>
+  The ngrok URL changes every time ngrok restarts (free plan). Update it in the Helius dashboard each time.
+  For production, set the permanent Railway API URL in the Helius dashboard.
+</Warning>
+
+### Setup in Helius Dashboard (for a new environment)
+
+1. Go to [dashboard.helius.dev](https://dashboard.helius.dev) → **Webhooks** → **New Webhook**
+2. Select network (`devnet` or `mainnet`)
+3. Webhook type: `enhanced`, Transaction type: `Any`
+4. Webhook URL: `https://<your-api-domain>/api/webhooks/helius`
+5. Authentication Header: generate a secret with `openssl rand -hex 32`, paste here and set as `HELIUS_WEBHOOK_SECRET` in `.env`
+6. Account Addresses → **Manage Addresses** → add `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK`
+
+---
+
+## Slack Alerts
+
+All alerts are sent via a single Slack incoming webhook URL (`SLACK_WEBHOOK_URL`).
+
+### Environment Variables
+
+```bash
+SLACK_WEBHOOK_URL=""        # Slack incoming webhook URL
+HELIUS_WEBHOOK_SECRET=""    # Authorization header value Helius sends
+```
+
+### Alert Reference
+
+#### 🔴 Payout Failed
+
+**Trigger:** BullMQ payout worker exhausts all retry attempts (`MAX_ATTEMPTS = 5`), OR a transaction fails on-chain (reported by Helius webhook).
+
+**Function:** `alertPayoutFailed(payoutId, saleEventId, error)`
+
+```
+🔴 *Payout Failed*
+payoutId: `clxyz...`
+saleEventId: `clxyz...`
+error: Transaction simulation failed: ...
+ts: 2026-03-17T10:23:00.000Z
+```
+
+**Action:** Check `PayoutRecord` status in Prisma Studio. Investigate the on-chain error. If the vault was empty, top it up and re-queue the job manually.
+
+---
+
+#### 🟡 Low Vault Balance
+
+**Trigger:** After each successful payout, if `store.vaultEurc` drops below `€100`.
+
+**Function:** `alertLowVaultBalance(storeId, storeName, balanceEurc, thresholdEurc)`
+
+```
+🟡 *Low Vault Balance*
+store: *Dampkring* (`clxyz...`)
+balance: €43.20 EURC
+threshold: €100.00 EURC
+action: top up vault to resume payouts
+ts: 2026-03-17T10:23:00.000Z
+```
+
+**Action:** Retailer funds the vault via the dashboard (`fund_store` instruction). Pending BullMQ jobs retry automatically with exponential backoff — they will resume once the vault has sufficient balance.
+
+---
+
+#### 🔴 POS Ingestion Error
+
+**Trigger:** An unexpected error during POS event processing after auth passed (e.g. database failure, schema mismatch).
+
+**Function:** `alertPosIngestionError(storeId, error)`
+
+```
+🔴 *POS Ingestion Error*
+storeId: `clxyz...`
+error: Cannot read properties of undefined (reading 'id')
+ts: 2026-03-17T10:23:00.000Z
+```
+
+**Action:** Check API server logs. The POS event was not saved — EB will retry the webhook automatically.
+
+---
+
+#### 🟡 Unknown Budtender
+
+**Trigger:** A sale arrives with a `staffId` that doesn't match any active `StoreMembership.posStaffRef`. The sale is saved as `SKIPPED` — no payout is issued.
+
+**Function:** `alertUnknownBudtender(storeId, posStaffRef)`
+
+```
+🟡 *Unknown Budtender*
+storeId: `clxyz...`
+posStaffRef: `EB-STAFF-042`
+action: sale saved as SKIPPED — link this staff ID in Store Memberships
+ts: 2026-03-17T10:23:00.000Z
+```
+
+**Action:** Go to the retailer dashboard → Staff → link `posStaffRef` to the correct budtender. The skipped sale cannot be retroactively paid out — notify the budtender manually if needed.
+
+---
+
+#### ℹ️ Store Frozen
+
+**Trigger:** An admin calls `PUT /api/admin/stores/:id/freeze`.
+
+**Function:** `alertStoreFrozen(storeId, storeName, adminId)`
+
+```
+ℹ️ *Store Frozen*
+store: *Dampkring* (`clxyz...`)
+frozenBy: `clxyz...`
+ts: 2026-03-17T10:23:00.000Z
+```
+
+**Action:** Informational. No action required unless the freeze was unintentional — use `PUT /api/admin/stores/:id/unfreeze` to resume.
+
+---
+
+---
+
+## Sentry
+
+Sentry captures exceptions in the three highest-risk paths. All other unhandled Express errors are caught by the Sentry error handler middleware automatically.
+
+### Environment variables
+
+```bash
+SENTRY_DSN=""               # API server (Node.js)
+NEXT_PUBLIC_SENTRY_DSN=""   # Next.js apps (same DSN value, different prefix)
+```
+
+Both are silently disabled when not set — the app runs normally without them.
+
+### Where exceptions are captured
+
+| Location | Event |
+|---|---|
+| `payout-queue.ts` worker `failed` handler | Payout exhausted all BullMQ retries |
+| `routes/webhooks.ts` Helius handler | Transaction confirmed as failed on-chain |
+| `routes/pos.ts` catch block | Unexpected error during POS event ingestion |
+| All Express routes (automatic) | Any unhandled error via `Sentry.setupExpressErrorHandler(app)` |
+
+### Setup
+
+1. Create a project at [sentry.io](https://sentry.io) — choose **Node.js** for the API, **Next.js** for the three frontend apps
+2. Copy the DSN from **Project Settings → Client Keys (DSN)**
+3. Set `SENTRY_DSN` and `NEXT_PUBLIC_SENTRY_DSN` in `.env` (same value)
+4. Optionally uncomment `org` and `project` in each `next.config.ts` to enable source map uploads:
+
+```typescript
+// apps/retailer/next.config.ts
+export default withSentryConfig(nextConfig, {
+  org: 'moongrow',
+  project: 'moongrow-retailer',
+  silent: true,
+  disableLogger: true,
+})
+```
+
+### Config files
+
+Each Next.js app has three Sentry config files auto-loaded by `@sentry/nextjs`:
+
+| File | Runtime |
+|---|---|
+| `sentry.client.config.ts` | Browser |
+| `sentry.server.config.ts` | Node.js (SSR, API routes) |
+| `sentry.edge.config.ts` | Edge runtime (middleware) |
+
+---
+
+## Fallback Behavior
+
+If `SLACK_WEBHOOK_URL` is not configured, `send()` logs to stdout instead:
+
+```
+[slack-alerts] 🔴 *Payout Failed*
+payoutId: `clxyz...`
+...
+```
+
+This ensures local development and staging environments work without a real Slack workspace.

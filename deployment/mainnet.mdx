@@ -1,0 +1,162 @@
+---
+title: "Mainnet deployment"
+description: "Checklist for deploying Moongrow to Solana mainnet-beta and production infrastructure"
+---
+
+<Warning>
+  This page is for the production launch. The current pilot runs on devnet. Do not deploy to mainnet-beta before completing the full security review checklist.
+</Warning>
+
+## Pre-launch checklist
+
+**Smart contract**
+- [ ] Full Anchor program audit completed
+- [ ] All test suites pass (`anchor test`)
+- [ ] `declare_id!` updated for mainnet program ID
+- [ ] `Anchor.toml` `[programs.mainnet-beta]` entry added
+- [ ] `max_payout_lamports` set to a conservative cap
+- [ ] Upgrade authority keypair stored in hardware wallet or multisig
+
+**Infrastructure**
+- [ ] Railway project created (API, Postgres, Redis)
+- [ ] Vercel projects connected (retailer, budtender, admin)
+- [ ] Helius mainnet API key provisioned
+- [ ] Helius mainnet webhooks configured
+- [ ] BVNK account active and EUR → EURC conversion tested
+- [ ] Circle EURC mainnet mint address verified: `HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr`
+
+**Security**
+- [ ] Backend signer keypair generated on air-gapped machine
+- [ ] `BACKEND_SIGNER_PRIVATE_KEY` stored in Railway secrets only — **never as a keypair file on disk or in the repo**
+- [ ] All `.env` files removed from git history (run `git-secrets` scan)
+- [ ] Privy production app ID configured
+
+<Warning>
+  **The mainnet backend signer must never exist as a file.** The devnet workflow uses `keys/backend-signer-devnet.json` for convenience, but this pattern is forbidden on mainnet. Generate the keypair on an air-gapped machine, extract the base58 private key, and inject it exclusively via Railway's secret management as `BACKEND_SIGNER_PRIVATE_KEY`. Discard the keypair file immediately. A leaked mainnet signer can drain every store vault.
+</Warning>
+
+## Solana mainnet deployment
+
+```bash
+# Switch CLI to mainnet
+solana config set --url mainnet-beta
+
+# Fund the upgrade authority with real SOL (~2.7 SOL needed)
+# Transfer from your hardware wallet
+
+# Build (same as devnet)
+anchor build
+
+# Deploy to mainnet-beta
+anchor deploy \
+  --program-name moongrow \
+  --provider.cluster mainnet-beta \
+  --upgrade-authority ~/.config/solana/id.json
+```
+
+## Environment variables (production)
+
+Set these in Railway and Vercel dashboards. Never in `.env` files.
+
+```env
+# Solana
+SOLANA_CLUSTER=mainnet-beta
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+HELIUS_WEBHOOK_SECRET=<helius webhook signing secret>
+BACKEND_SIGNER_PRIVATE_KEY=<base58 private key — KEEP SECRET>
+EURC_MINT_MAINNET=HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr
+MOONGROW_PROGRAM_ID=<mainnet program ID>
+MOONGROW_TREASURY_WALLET=<treasury pubkey>
+
+# Database
+DATABASE_URL=postgresql://...
+DIRECT_URL=postgresql://...
+
+# Redis
+REDIS_URL=redis://...
+
+# Privy (production app)
+NEXT_PUBLIC_PRIVY_APP_ID=<production app ID>
+PRIVY_APP_SECRET=<production app secret>
+```
+
+## EURC on mainnet
+
+Circle's EURC on Solana mainnet: `HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr`
+
+Retailers fund their vaults by converting EUR to EURC via BVNK, then depositing to their store's vault token account. The Retailer dashboard guides them through this flow.
+
+## Initialize mainnet config PDA
+
+After deployment, run the config initialization once with mainnet values:
+
+```typescript
+await program.methods
+  .initializeConfig(
+    treasuryWallet,
+    backendSignerPubkey,
+    50,                       // 0.5% platform fee
+    new BN(10_000_000_000)    // max payout: 10,000 EURC
+  )
+  .accounts({ admin, config, systemProgram })
+  .rpc()
+```
+
+## Hosting
+
+**API + Postgres + Redis** → Railway
+- Set `NODE_ENV=production`
+- Enable automatic deploys from `main` branch
+- Configure health check at `/api/health`
+
+### Deploying to Railway
+
+There are two Railway deploy commands with different behaviour:
+
+| Command | What it does |
+|---|---|
+| `railway up --detach` | Builds from source and deploys a new image. Use this after code changes. |
+| `railway redeploy` | Restarts the existing image without rebuilding. Use this to cycle the process (e.g. after env var changes). |
+
+**Always use `railway up --detach` when deploying new code.** `railway redeploy` will not pick up source changes — it only restarts what is already built.
+
+**Frontends** → Vercel
+- Connect each app directory (`apps/retailer`, `apps/budtender`, `apps/admin`)
+- Set root directory per app
+- Add all `NEXT_PUBLIC_*` env vars
+
+## Post-deploy verification
+
+```bash
+# Verify program is live
+solana program show <mainnet-program-id> --url mainnet-beta
+
+# Check config PDA
+solana account <config-pda> --url mainnet-beta
+
+# Smoke test with mainnet EURC
+# (requires funded backend signer and treasury wallet)
+SOLANA_CLUSTER=mainnet-beta \
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=KEY \
+BACKEND_SIGNER_PRIVATE_KEY=KEY \
+MOONGROW_TREASURY_WALLET=PUBKEY \
+npx tsx packages/api/scripts/test-mainnet-payout.ts
+```
+
+## Upgrading the program
+
+```bash
+anchor upgrade target/deploy/moongrow.so \
+  --program-id <mainnet-program-id> \
+  --provider.cluster mainnet-beta \
+  --upgrade-authority ~/.config/solana/id.json
+```
+
+Upload updated IDL after every upgrade:
+
+```bash
+anchor idl upgrade \
+  --filepath target/idl/moongrow.json \
+  --provider.cluster mainnet-beta \
+  <mainnet-program-id>
+```

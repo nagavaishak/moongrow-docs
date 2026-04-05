@@ -1,0 +1,129 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Moongrow",
+  "colors": {
+    "primary": "#0D6B4A",
+    "light": "#14A366",
+    "dark": "#084D35"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Docs",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/tech-stack",
+              "architecture/data-flow"
+            ]
+          },
+          {
+            "group": "Backend",
+            "pages": [
+              "backend/pos-ingestion",
+              "backend/campaign-engine",
+              "backend/payout-worker",
+              "backend/bonus-system",
+              "backend/realtime-sse"
+            ]
+          },
+          {
+            "group": "Smart Contract",
+            "pages": [
+              "smart-contract/overview",
+              "smart-contract/instructions",
+              "smart-contract/security"
+            ]
+          },
+          {
+            "group": "Auth",
+            "pages": [
+              "auth/privy",
+              "auth/pos-auth"
+            ]
+          },
+          {
+            "group": "Database",
+            "pages": [
+              "database/schema"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/devnet",
+              "deployment/mainnet"
+            ]
+          },
+          {
+            "group": "Monitoring",
+            "pages": [
+              "monitoring/alerts"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/confirmo"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/adding-a-store",
+              "guides/testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API",
+            "pages": [
+              "backend/api-reference"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/moongrow",
+          "icon": "github"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:hello@moongrow.io"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/moongrow"
+    }
+  }
+}

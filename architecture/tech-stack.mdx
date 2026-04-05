@@ -1,0 +1,57 @@
+---
+title: "Tech stack"
+description: "Every framework and service in the Moongrow platform and why we chose it"
+---
+
+## Full stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Frontend | Next.js 15 (App Router) | RSC + streaming, Vercel-native deployment |
+| Styling | Tailwind CSS | Utility-first, no runtime overhead |
+| Data fetching | TanStack Query | Optimistic updates, background refetch |
+| Auth + Wallets | Privy | Email-to-embedded-wallet for budtenders; BYOW (bring your own wallet) for retailers |
+| Backend API | Express + TypeScript | Lightweight, well-understood, easy to extend |
+| Database | PostgreSQL + Prisma | Relational integrity for financial data; Prisma for type-safe queries |
+| Queue | BullMQ + Redis | At-least-once delivery, exponential backoff, job visibility |
+| On-chain | Anchor (Rust) + Solana | Sub-second finality, <$0.001 tx fees, native EURC support |
+| Stablecoin | EURC (Circle) | EUR-denominated, Circle-regulated, native on Solana |
+| RPC | Helius | Dedicated node, transaction confirmation webhooks |
+| On/off-ramp | Confirmo | EUR → EURC invoice on-ramp; settles EURC directly to vault token account |
+| POS | EB (eb.nl) | Standard Dutch coffeeshop POS — HMAC-signed webhooks |
+| Hosting | Vercel (frontends) + Railway (API, Redis, Postgres) | Zero-config deploys, autoscaling |
+| i18n | next-intl | English / Dutch |
+
+## Frontend apps
+
+All three frontends are Next.js 15 with the App Router. They share types and validators from `@moongrow/shared` and talk exclusively to the Express API.
+
+**Retailer** (`apps/retailer`, port 3000) — Privy BYOW wallet connect. Retailers fund vaults, manage campaigns, invite budtenders, and view payout history.
+
+**Budtender** (`apps/budtender`, port 3001) — PWA with mobile-first layout. Privy email login creates an embedded Solana wallet automatically. Budtenders see their earnings in real time.
+
+**Admin** (`apps/admin`, port 3002) — Internal Moongrow ops. Freeze/unfreeze stores, view system-wide payout records, manage platform config.
+
+## Backend (`packages/api`)
+
+Express server with three main responsibilities:
+
+- **POS ingestion** — validates and stores EB webhook events
+- **Campaign engine** — calculates commissions using active `CampaignRule` records
+- **Payout queue** — BullMQ worker calls the Anchor program to execute on-chain transfers
+
+The server is the only component that holds the `BACKEND_SIGNER_PRIVATE_KEY`. It is the sole authorized caller of `execute_payout` on-chain.
+
+## Database (`packages/db`)
+
+PostgreSQL with Prisma. The schema has 14 models. The key financial tables (`SaleEvent`, `PayoutRecord`) are effectively append-only — records are never deleted and their core fields are never updated after creation.
+
+See [Database Schema](/database/schema) for the full model reference.
+
+## Anchor program (`programs/moongrow`)
+
+Rust program compiled with Anchor 0.32. Deployed on Solana devnet at `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK`.
+
+The program has 8 instructions: `initialize_config`, `update_config`, `initialize_store`, `fund_store`, `execute_payout`, `withdraw`, `freeze_store`, `unfreeze_store`.
+
+See [Smart Contract Instructions](/smart-contract/instructions) for details.

@@ -1,0 +1,102 @@
+---
+title: "Data flow"
+description: "Step-by-step trace of a single POS sale from webhook to on-chain payout"
+---
+
+A sale event travels through five stages from the POS to the budtender's wallet. Each stage is independently auditable.
+
+## Stage 1: POS webhook ingestion
+
+The EB POS system sends a signed HTTP request to the API when a sale completes.
+
+```http
+POST /api/pos/events
+x-api-key: sk_live_...
+x-hmac-signature: sha256=...
+x-timestamp: 1710000000
+```
+
+The API validates:
+1. API key lookup — resolves to a `PosApiKey` record linked to a specific store
+2. HMAC-SHA256 signature — computed over `timestamp + "." + rawBody` using the per-store `signingSecret`
+3. Timestamp replay guard — rejects requests older than 60 seconds (`POS_REPLAY_WINDOW_SECONDS`)
+4. Idempotency — `(storeId, posTransactionId)` unique constraint prevents duplicate processing
+
+If any check fails, the request is rejected with `400` or `401`. No partial state is written.
+
+## Stage 2: Campaign resolution
+
+For each line item in the sale:
+
+1. Look up the SKU in `SkuCatalogItem` by `(storeId, externalSku)`
+2. Find the single `ACTIVE` campaign with a `CampaignRule` for that SKU — only one active campaign per SKU is allowed (enforced at creation)
+3. Calculate commission: FLAT = fixed EUR amount per unit; PERCENTAGE = rate × line total
+4. Snapshot the applied rule into `SaleEvent.campaignSnapshot` as JSON
+
+The snapshot is immutable. Future campaign edits cannot change the commission for a sale that has already been ingested.
+
+## Stage 3: Persistence and queue
+
+```
+PostgreSQL (atomic transaction):
+  INSERT SaleEvent { status: PENDING }
+  INSERT SaleEventLineItem[] (one per SKU)
+  INSERT PayoutRecord { status: PENDING }
+
+BullMQ:
+  payoutQueue.add(PAYOUT_JOB, {
+    saleEventId, storeId, budtenderWallet, amountEurc, feeEurc
+  })
+```
+
+The BullMQ job is added only after the database writes succeed.
+
+## Stage 4: On-chain payout
+
+The BullMQ worker picks up the job and calls the Anchor program:
+
+```typescript
+// Fee math (50 bps = 0.5%)
+const feeEurc = amountEurc * (PLATFORM_FEE_BPS / 10_000)
+const totalLamports = Math.round((amountEurc + feeEurc) * 1_000_000)
+
+program.methods
+  .executePayout(saleEventId, new BN(totalLamports))
+  .accounts({
+    storeVault,
+    budtenderTokenAccount,
+    treasuryTokenAccount,
+    payoutRecord,
+    ...
+  })
+  .rpc()
+```
+
+On-chain, `execute_payout`:
+1. Verifies the caller is the registered `backend_signer`
+2. Verifies the store is not frozen
+3. Creates the `PayoutRecord` PDA — fails if it already exists (double-pay prevention)
+4. Splits `totalLamports` into budtender share and fee: `fee = total * fee_bps / 10_000`
+5. PDA-signs two SPL token transfers from `vaultTokenAccount`
+
+## Stage 5: Confirmation
+
+Helius sends a transaction confirmation webhook when the Solana slot is finalized:
+
+```
+POST /api/webhooks/helius
+→ PayoutRecord { status: CONFIRMED, confirmedAt: now() }
+→ SaleEvent { status: CONFIRMED }
+```
+
+The payout is now publicly auditable on Solana Explorer.
+
+## Error paths
+
+| Scenario | Behaviour |
+|---|---|
+| Unknown budtender (POS staff ID not in `StoreMembership`) | `SaleEvent` saved with `status = SKIPPED`. No payout. Retailer alerted. |
+| Vault empty | BullMQ retries with exponential backoff (5 attempts, 5s base delay). Resumes when funded. |
+| Duplicate sale on-chain | Second `execute_payout` hits Solana account collision — impossible to pay twice. |
+| Max retries exceeded | `SaleEvent` + `PayoutRecord` set to `FAILED`. Slack alert queued. |
+| POS signature invalid | Request rejected `401`. Nothing written to database. |

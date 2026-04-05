@@ -1,0 +1,344 @@
+---
+title: "Database Schema"
+description: "Prisma schema reference for all 18 models in the Moongrow database"
+---
+
+The Moongrow database is PostgreSQL managed via Prisma. The schema is the single source of truth for all database types across the monorepo — imported as `@moongrow/db`.
+
+Schema location: `packages/db/prisma/schema.prisma`
+
+## Models
+
+### User
+
+Represents a retailer, budtender, or admin. Created automatically on first Privy login.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` (cuid) | Primary key |
+| `privyId` | `String?` | Privy auth DID (unique) |
+| `email` | `String?` | Optional, unique |
+| `walletAddress` | `String?` | Solana pubkey (unique) |
+| `role` | `UserRole` | `BUDTENDER \| RETAILER \| ADMIN` |
+| `isActive` | `Boolean` | Soft delete flag |
+| `pushToken` | `String?` | Web Push device token for notifications |
+
+---
+
+### Store
+
+A coffeeshop. One owner, multiple budtenders, one vault PDA.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` (cuid) | Primary key |
+| `slug` | `String` | URL-safe unique identifier |
+| `ownerWallet` | `String` | Retailer's Solana pubkey |
+| `vaultPda` | `String?` | Anchor PDA address (set after `initialize_store`) |
+| `vaultEurc` | `Decimal` | Cached vault balance — refreshed on fund/withdraw/payout |
+| `vaultSol` | `Decimal` | Cached SOL balance |
+| `isFrozen` | `Boolean` | Mirrors on-chain `StoreVault.is_frozen` |
+| `subscriptionTier` | `String?` | `basic \| pro \| enterprise` (default `basic`) |
+| `subscriptionStatus` | `String?` | `active \| overdue \| cancelled` (default `active`) |
+| `onboardingStep` | `Int` | 0–6 (default 0) |
+| `onboardingComplete` | `Boolean` | Set to `true` after step 6 (default `false`) |
+| `lowBalanceThresholdPct` | `Decimal` | % of committed budget for low-balance warning (default 20) |
+
+---
+
+### StoreMembership
+
+Budtender ↔ Store join table. A budtender must have an active membership to receive payouts.
+
+| Field | Type | Notes |
+|---|---|---|
+| `posStaffRef` | `String?` | POS-side staff ID — maps EB staff IDs to Moongrow users |
+| `isActive` | `Boolean` | Deactivating prevents future payouts to this budtender |
+
+Unique constraint: `(storeId, userId)`.
+
+---
+
+### StoreInvite
+
+Retailer-generated token that a budtender uses to join a store.
+
+| Field | Type | Notes |
+|---|---|---|
+| `token` | `String` | 256-bit hex token (unique) |
+| `expiresAt` | `DateTime` | Invite expiry |
+| `usedAt` | `DateTime?` | Set when redeemed |
+
+---
+
+### PosPartner
+
+A supported POS system registered in Moongrow (e.g. EB at eb.nl).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` (cuid) | Primary key |
+| `name` | `String` | Human-readable name (e.g. `"EB"`) |
+| `slug` | `String` | URL-safe unique identifier (e.g. `"eb"`) |
+
+---
+
+### StorePosPartner
+
+Join record connecting a specific `Store` to a `PosPartner`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `storeId` | `String` | FK → Store |
+| `posPartnerId` | `String` | FK → PosPartner |
+
+Unique constraint: `(storeId, posPartnerId)`.
+
+---
+
+### PosApiKey
+
+Per-store API key for POS webhook authentication.
+
+| Field | Type | Notes |
+|---|---|---|
+| `keyHash` | `String` | SHA-256 of the raw API key (unique) |
+| `keyPrefix` | `String` | First 8 chars for display |
+| `signingSecret` | `String` | HMAC-SHA256 signing secret (plaintext — must be readable to verify) |
+| `isActive` | `Boolean` | Revoked keys have `revokedAt` set |
+
+---
+
+### SkuCatalogItem
+
+Store product catalog synced from the POS.
+
+| Field | Type | Notes |
+|---|---|---|
+| `externalSku` | `String` | POS-side SKU identifier |
+| `basePrice` | `Decimal` | EUR price |
+
+Unique constraint: `(storeId, externalSku)`.
+
+---
+
+### Campaign
+
+An incentive program created by a retailer. Has a budget and optional date range.
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `CampaignStatus` | See values below |
+| `budgetEurc` | `Decimal` | Logically allocated budget |
+| `spentEurc` | `Decimal` | Running total of paid commissions |
+
+**`CampaignStatus` values:**
+
+| Value | Meaning |
+|---|---|
+| `DRAFT` | Not yet active |
+| `ACTIVE` | Running — accepting sales |
+| `PAUSED_MANUAL` | Paused by retailer — never auto-resumed |
+| `PAUSED_SYSTEM` | Auto-paused when available balance = 0 — auto-resumed on top-up |
+| `ENDED` | Past end date |
+| `DEPLETED` | Budget fully spent |
+
+<Note>
+  The legacy `PAUSED` status is treated as equivalent to `PAUSED_MANUAL` in all API logic. Only `PAUSED_MANUAL` campaigns can be manually resumed. `PAUSED_SYSTEM` campaigns resume automatically when the store's available balance becomes positive again after a top-up.
+</Note>
+
+---
+
+### CampaignRule
+
+Per-SKU commission rate within a campaign.
+
+| Field | Type | Notes |
+|---|---|---|
+| `commissionType` | `CommissionType` | `FLAT \| PERCENTAGE` |
+| `commissionValue` | `Decimal` | EUR (flat) or decimal fraction (percentage) |
+
+Unique constraint: `(campaignId, skuId)`.
+
+---
+
+### SaleEvent
+
+**Immutable** POS transaction log. Never updated after ingestion.
+
+| Field | Type | Notes |
+|---|---|---|
+| `posTransactionId` | `String` | POS-side transaction ID |
+| `budtenderUserId` | `String?` | Null if staff ID was unknown |
+| `totalCommission` | `Decimal` | Total EURC commission for this sale |
+| `campaignSnapshot` | `Json` | Rates locked at ingestion time |
+| `status` | `SaleEventStatus` | `PENDING → QUEUED → SENT → CONFIRMED` |
+| `receivedAt` | `DateTime` | Immutable ingestion timestamp |
+
+Unique constraint: `(storeId, posTransactionId)`.
+
+`SaleEventStatus` values: `PENDING`, `PROCESSING`, `QUEUED`, `SENT`, `CONFIRMED`, `FAILED`, `SKIPPED`
+
+---
+
+### SaleEventLineItem
+
+Per-SKU breakdown of a `SaleEvent`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `commissionEurc` | `Decimal` | Calculated commission for this line |
+| `campaignRuleSnapshot` | `Json?` | Rule snapshot (not FK'd — allows campaign deletion) |
+
+---
+
+### PayoutRecord
+
+One per `SaleEvent`. Tracks the on-chain transaction lifecycle.
+
+| Field | Type | Notes |
+|---|---|---|
+| `payoutPda` | `String?` | On-chain PayoutRecord PDA address |
+| `txHash` | `String?` | Solana transaction signature |
+| `status` | `PayoutStatus` | `PENDING \| SUBMITTED \| CONFIRMED \| FAILED` |
+| `attemptCount` | `Int` | BullMQ attempt counter |
+| `failureReason` | `String?` | Last error message |
+
+---
+
+### AuditLog
+
+Append-only log of all admin and retailer actions. Never modified.
+
+| Field | Type | Notes |
+|---|---|---|
+| `action` | `String` | e.g. `"campaign.created"`, `"store.frozen"` |
+| `entityType` | `String?` | e.g. `"Campaign"`, `"PosApiKey"` |
+| `metadata` | `Json?` | Before/after snapshot |
+
+---
+
+### Bonus
+
+Staff competition created by a retailer. Budget is earmarked from the store wallet on creation.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` (cuid) | Primary key |
+| `storeId` | `String` | Owning store |
+| `name` | `String` | Competition display name |
+| `type` | `BonusType` | `RANKED \| THRESHOLD \| SPRINT` |
+| `metric` | `BonusMetric` | `COMMISSION_AMOUNT \| UNITS_SOLD` |
+| `skuId` | `String?` | Required when `metric = UNITS_SOLD` |
+| `scope` | `BonusScope` | `STORE \| CHAIN` |
+| `storeIds` | `String[]` | Applicable store IDs (for chain-wide bonuses) |
+| `startsAt` | `DateTime` | Competition start |
+| `endsAt` | `DateTime` | Competition end — triggers auto-settlement |
+| `budgetTotal` | `Decimal` | Total prize pool (earmarked on creation) |
+| `budgetSpent` | `Decimal` | Actual payouts made (default 0) |
+| `status` | `BonusStatus` | `SCHEDULED \| ACTIVE \| COMPLETED \| CANCELLED` |
+| `tieRule` | `TieRule` | `SPLIT \| ALL_REWARDED` |
+| `prizeStructure` | `Json` | `[{position:1, amount:100}, {position:2, amount:50}]` |
+
+<Note>
+  Budget is earmarked the moment a bonus is created — regardless of `startsAt`. Cancelling a bonus (`DELETE /api/bonuses/:id`) releases the full `budgetTotal`. On completion, only `budgetSpent` is deducted and the remainder is released back to available balance.
+</Note>
+
+---
+
+### BonusPayout
+
+Per-winner payout record created when a bonus completes.
+
+| Field | Type | Notes |
+|---|---|---|
+| `bonusId` | `String` | FK → Bonus |
+| `userId` | `String` | Winning budtender |
+| `storeId` | `String` | Budtender's store |
+| `amount` | `Decimal` | Prize amount in EURC |
+| `position` | `Int?` | Final leaderboard rank |
+| `status` | `PayoutStatus` | `PENDING \| SUBMITTED \| CONFIRMED \| FAILED` |
+| `txHash` | `String?` | Solana transaction signature |
+| `settledAt` | `DateTime?` | Confirmation timestamp |
+
+---
+
+### WalletTransaction
+
+Unified ledger of all money movements for a store. Used to build the transaction history feed in the retailer dashboard.
+
+| Field | Type | Notes |
+|---|---|---|
+| `storeId` | `String` | Owning store |
+| `type` | `WalletTxType` | See values below |
+| `amount` | `Decimal` | Positive = credit, negative = debit |
+| `referenceId` | `String?` | FK to `PayoutRecord.id` or `BonusPayout.id` |
+| `txHash` | `String?` | On-chain signature |
+| `externalRef` | `String?` | Confirmo payout ID (for withdrawals) |
+| `withdrawalStatus` | `String?` | `PENDING \| PROCESSING \| PAID \| FAILED` |
+| `withdrawalIban` | `String?` | Masked IBAN e.g. `NL91****0000` |
+
+**`WalletTxType` values:** `TOP_UP`, `COMMISSION_PAID`, `BONUS_PAID`, `FEE_DEDUCTED`, `WITHDRAWAL`
+
+---
+
+### SupportTicket
+
+Retailer or staff support request with internal admin workflow.
+
+| Field | Type | Notes |
+|---|---|---|
+| `raisedByType` | `SupportRaisedBy` | `RETAILER \| STAFF` |
+| `raisedById` | `String` | User ID of the submitter |
+| `issueType` | `SupportIssueType` | `COMMISSION_DISPUTE \| ACCOUNT_ISSUE \| POS_SYNC \| OTHER` |
+| `description` | `String` | Issue description |
+| `referenceId` | `String?` | Linked payout/campaign ID |
+| `status` | `SupportStatus` | `OPEN \| IN_PROGRESS \| RESOLVED` |
+| `assignedTo` | `String?` | Admin user ID |
+| `notes` | `String?` | Internal admin notes |
+| `resolvedAt` | `DateTime?` | Resolution timestamp |
+
+---
+
+### SolFloatWallet
+
+Singleton row tracking the SOL fee-payer wallet used by the payout worker. Upserted on first `GET /api/admin/sol-float` call using the `SOL_FLOAT_WALLET_ADDRESS` env var.
+
+| Field | Type | Notes |
+|---|---|---|
+| `address` | `String` | Solana public key of the fee-payer wallet |
+| `balance` | `Decimal` | Cached SOL balance (decremented by estimated fee per payout) |
+| `threshold` | `Decimal` | Low balance alert threshold in SOL |
+
+<Note>
+  `SolFloatWallet.balance` is a cached estimate — decremented by `0.000005` SOL per payout tx. For a precise live balance, fetch on-chain via `connection.getBalance()`. The admin sol-float page shows the cached value, not a live RPC call.
+</Note>
+
+---
+
+### SolFeeTransaction
+
+One record per executed payout — tracks the Solana transaction fee paid by the float wallet.
+
+| Field | Type | Notes |
+|---|---|---|
+| `walletId` | `String` | FK → SolFloatWallet |
+| `storeId` | `String` | Store that triggered the payout |
+| `payoutId` | `String?` | FK → PayoutRecord |
+| `feeSOL` | `Decimal` | Estimated fee (hardcoded `0.000005` SOL per tx) |
+| `txHash` | `String?` | Solana transaction signature |
+
+---
+
+## Running migrations
+
+```bash
+# Create a new migration
+pnpm db:migrate
+
+# Push schema without migration file (dev only)
+pnpm db:push
+
+# Open Prisma Studio
+pnpm db:studio
+```

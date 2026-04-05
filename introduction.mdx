@@ -1,0 +1,57 @@
+---
+title: "Introduction"
+description: "Solana-based real-time commission engine for Dutch coffeeshops"
+---
+
+Moongrow is a real-time commission platform built on Solana. Retailers (coffeeshop owners) fund a non-custodial EURC vault on-chain, define SKU-level commission campaigns, and budtenders receive instant EURC payouts the moment a POS sale is validated — no manual reconciliation, no end-of-shift settlements.
+
+The platform connects a standard coffeeshop POS system (EB / eb.nl) to an Anchor program on Solana. Every sale triggers a cryptographically verified payout that is publicly auditable on-chain. The retailer controls their funds at all times — only the program can move EURC out of the vault, and only to pay out validated sales.
+
+The pilot runs in the Netherlands targeting a single store with 10–15 budtenders. Sales are denominated in EUR, commissions are settled in EURC (Circle's euro stablecoin), and budtenders receive payouts directly to their embedded Solana wallets.
+
+## What the platform does
+
+<CardGroup cols={2}>
+  <Card title="POS Integration" icon="cash-register">
+    Receives authenticated sale webhooks from EB (eb.nl) via HMAC-signed API calls with 60-second replay protection.
+  </Card>
+  <Card title="SKU-Level Campaigns" icon="tag">
+    Retailers define flat or percentage commission rates per SKU. Rates are snapshotted at ingestion — campaign edits never affect in-flight sales.
+  </Card>
+  <Card title="Instant EURC Payouts" icon="bolt">
+    BullMQ workers call the Anchor program within seconds of a validated sale. EURC moves directly from the store vault PDA to the budtender's wallet.
+  </Card>
+  <Card title="Non-Custodial Architecture" icon="lock">
+    Retailer funds are held in a program-controlled PDA, not a Moongrow wallet. Retailers can withdraw at any time. Double payments are physically impossible on-chain.
+  </Card>
+  <Card title="Bonus Competitions" icon="trophy">
+    Retailers run ranked, threshold, or sprint competitions with prize structures. Budget is earmarked on creation and auto-settled when the competition ends.
+  </Card>
+  <Card title="Real-Time Updates" icon="signal">
+    Server-Sent Events (SSE) push wallet updates, leaderboard changes, and commission settlements to all three frontends without polling.
+  </Card>
+</CardGroup>
+
+## Key numbers
+
+| Metric | Value |
+|--------|-------|
+| Platform fee | 3% per payout (300 bps) |
+| Payout settlement | ~seconds after sale |
+| Stablecoin | EURC (Circle) |
+| Network | Solana (devnet now, mainnet-beta for production) |
+| POS system | EB (eb.nl) |
+| Pilot scope | 1 store, 10–15 budtenders, Netherlands |
+
+## How it fits together
+
+```
+EB POS → Moongrow API → PostgreSQL + BullMQ → Anchor Program → Budtender Wallet
+                    ↘ SSE stream → Retailer / Budtender / Admin frontends
+```
+
+The API validates and ingests each sale, calculates the commission using the active campaign, creates a payout job, and the BullMQ worker calls `execute_payout` on the Anchor program. The on-chain PayoutRecord PDA seeded by `saleEventId` makes replay attacks physically impossible — the same sale can never be paid twice.
+
+<Card title="Get the project running" icon="rocket" href="/quickstart">
+  Follow the quickstart guide to have the full stack running locally in under 10 minutes.
+</Card>

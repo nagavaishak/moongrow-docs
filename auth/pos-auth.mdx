@@ -1,0 +1,104 @@
+---
+title: "POS Authentication"
+description: "API key and HMAC signing for EB POS webhook authentication"
+---
+
+The POS integration uses a two-layer authentication scheme. Both layers must pass for a webhook to be accepted.
+
+## Layer 1: API key
+
+Each store-POS connection has one or more `PosApiKey` records. The retailer generates a key in the dashboard and configures it in the EB POS system.
+
+```
+x-api-key: sk_live_abc123...
+```
+
+**Key format:** `sk_live_` + 32 random bytes (hex) — 72 characters total.
+
+**Storage:** Only a hash of the key is stored in `PosApiKey.keyHash`. The raw key is shown once at creation and never retrievable. If lost, a new key must be issued.
+
+**Lookup:** The API resolves the key on every request. The `keyPrefix` (first 8 characters) is stored in plaintext to make key identification possible in logs.
+
+## Layer 2: HMAC-SHA256 signature
+
+The EB POS system signs every request body before sending. This proves the body was not modified in transit and that the sender knows the `signingSecret`.
+
+### Signature computation
+
+```
+message = "{timestamp}.{rawBody}"
+signature = HMAC-SHA256(signingSecret, message)
+header = "sha256=" + hex(signature)
+```
+
+### Server-side verification
+
+```typescript
+import crypto from 'crypto'
+
+function verifyHmac(
+  signingSecret: string,
+  timestamp: string,
+  rawBody: Buffer,
+  receivedSig: string,
+): boolean {
+  const message = `${timestamp}.${rawBody.toString()}`
+  const expected = crypto
+    .createHmac('sha256', signingSecret)
+    .update(message)
+    .digest('hex')
+  const expectedHeader = `sha256=${expected}`
+
+  // Constant-time comparison prevents timing attacks
+  return crypto.timingSafeEqual(
+    Buffer.from(expectedHeader),
+    Buffer.from(receivedSig),
+  )
+}
+```
+
+The comparison uses `crypto.timingSafeEqual` to prevent timing attacks that could reveal the secret.
+
+## Layer 3: Timestamp replay guard
+
+```typescript
+const now = Math.floor(Date.now() / 1000)
+const ts = parseInt(timestampHeader, 10)
+
+if (Math.abs(now - ts) > POS_REPLAY_WINDOW_SECONDS) {
+  return res.status(400).json({ error: 'Request expired' })
+}
+```
+
+`POS_REPLAY_WINDOW_SECONDS = 60` (from `@moongrow/shared/constants`).
+
+An attacker who captures a valid signed request cannot replay it more than 60 seconds later.
+
+## Key rotation
+
+To rotate a POS API key:
+
+1. Retailer generates a new key in the dashboard → new `PosApiKey` record created, old one remains active
+2. New key is configured in the POS system
+3. Old key is revoked in the dashboard → `isActive = false`, `revokedAt` set
+
+There is a grace period where both keys are valid, allowing zero-downtime rotation.
+
+## Testing POS auth locally
+
+Use the seed script's generated API key and signing secret, or generate a test request:
+
+```bash
+TIMESTAMP=$(date +%s)
+BODY='{"posTransactionId":"test-1","storeExternalId":"pilot","staffId":"staff-1","timestamp":"2026-03-16T12:00:00Z","lineItems":[]}'
+SECRET="your_signing_secret_here"
+
+SIG=$(echo -n "${TIMESTAMP}.${BODY}" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print "sha256="$2}')
+
+curl -X POST http://localhost:3100/api/pos/events \
+  -H "x-api-key: sk_live_your_key" \
+  -H "x-hmac-signature: $SIG" \
+  -H "x-timestamp: $TIMESTAMP" \
+  -H "Content-Type: application/json" \
+  -d "$BODY"
+```

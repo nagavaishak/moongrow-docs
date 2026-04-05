@@ -1,0 +1,97 @@
+---
+title: "Security"
+description: "On-chain and off-chain security properties of the Moongrow commission platform"
+---
+
+## On-chain guarantees
+
+### Double-pay prevention
+
+The `PayoutRecord` PDA is seeded by `["payout", sale_event_id]`. Creating this account is an atomic part of `execute_payout`.
+
+If a second `execute_payout` call is made with the same `sale_event_id`, Solana's runtime rejects it before any program logic executes — the account already exists and Anchor's `init` constraint enforces uniqueness at the protocol level.
+
+This is not a software check. It is a property of how Solana accounts work. There is no code path that can bypass it.
+
+### Non-custodial vaults
+
+Retailer EURC is held in `vault_token_account`, a token account whose authority is the `store_vault` PDA — not any externally owned account. The PDA has no private key. Funds can only move via program instructions.
+
+The program allows two outgoing paths:
+
+| Instruction | Authorized caller |
+|---|---|
+| `execute_payout` | `Config.backend_signer` only |
+| `withdraw` | `StoreVault.retailer` only |
+
+No other instruction moves EURC out.
+
+### Authority checks
+
+Every instruction that moves funds verifies the caller:
+
+| Instruction | Check |
+|---|---|
+| `execute_payout` | `ctx.accounts.backend_signer.key() == config.backend_signer` |
+| `fund_store` | `ctx.accounts.retailer.key() == store_vault.retailer` |
+| `withdraw` | `ctx.accounts.retailer.key() == store_vault.retailer` |
+| `freeze_store` | `ctx.accounts.admin.key() == config.admin` |
+| `unfreeze_store` | `ctx.accounts.admin.key() == config.admin` |
+
+Anchor enforces these with `#[account(constraint = ...)]` attributes. Violations return `ConstraintRaw` errors before any state changes.
+
+### Frozen stores
+
+There are two independent freeze mechanisms:
+
+**API-level freeze** (`PUT /api/admin/stores/:id/freeze`) — sets `Store.isFrozen = true` in the database. New sale events are saved as `SKIPPED` and no BullMQ payout jobs are enqueued. This does not affect the on-chain program.
+
+**On-chain freeze** (`freeze_store` instruction, callable by `Config.admin`) — sets `StoreVault.is_frozen = true` on-chain. Blocks both `execute_payout` and `withdraw` at the Solana program level. The EURC remains in the vault — it is not seized or moved. Unfreezing resumes on-chain operations.
+
+To fully freeze a store (halt payouts AND block retailer withdrawals), both the API freeze and the on-chain `freeze_store` instruction must be called. The API admin endpoint currently performs only the off-chain freeze.
+
+### Maximum payout cap
+
+`Config.max_payout_lamports` limits the maximum single `execute_payout` call. This bounds the blast radius of a compromised backend signer.
+
+## Off-chain security
+
+### Backend signer key management
+
+`BACKEND_SIGNER_PRIVATE_KEY` is the only secret that grants write access to the on-chain program. It must:
+- Never be committed to version control (`keys/` is gitignored)
+- Be stored in Railway secrets only — never in `.env` files in production
+- Be rotated by calling `update_config` with the new pubkey
+
+The backend signer cannot modify the program, change the fee, or transfer funds to itself. It can only call `execute_payout`.
+
+### POS webhook authentication
+
+Two independent layers protect the POS ingestion endpoint:
+
+1. **API key** — store-specific, hashed at rest, revocable
+2. **HMAC-SHA256** — body signing with the per-store `signingSecret`
+
+An attacker needs both to inject a fake sale event. The `signingSecret` is generated server-side and never transmitted to the client.
+
+### Timestamp replay protection
+
+Every POS webhook must include an `x-timestamp` header. The API rejects requests older than 60 seconds. An attacker who captures a valid signed request cannot replay it more than 60 seconds later.
+
+### Idempotency vs replay
+
+| Scenario | Behaviour |
+|---|---|
+| POS re-delivers same transaction | Accepted silently (idempotent), no second payout |
+| Captured request replayed after >60s | Rejected by timestamp check |
+| Same `sale_event_id` submitted on-chain twice | Rejected by `PayoutRecord` PDA collision |
+
+## Audit trail
+
+Every financial action has a corresponding record:
+
+- **`SaleEvent`** — immutable log with `campaignSnapshot` (append-only, never modified)
+- **`PayoutRecord`** — contains `txHash` and `payoutPda` (verifiable on Solana Explorer)
+- **`AuditLog`** — append-only log of all admin and retailer actions
+
+The on-chain `PayoutRecord` PDA is the ground truth. If the database is corrupted, the on-chain state is authoritative.

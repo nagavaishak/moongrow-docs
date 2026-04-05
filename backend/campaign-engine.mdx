@@ -1,0 +1,97 @@
+---
+title: "Campaign Engine"
+description: "How commission rates are defined, resolved, and snapshotted at ingestion time"
+---
+
+The campaign engine translates a sale event into a EURC amount. It runs synchronously during POS ingestion and its output is permanently recorded before any payout is attempted.
+
+## Data model
+
+```
+Campaign
+  ├── name, status (DRAFT / ACTIVE / PAUSED / ENDED / DEPLETED)
+  ├── budgetEurc, spentEurc
+  ├── startsAt, endsAt
+  └── rules[]
+        CampaignRule
+          ├── skuId         (FK → SkuCatalogItem)
+          ├── commissionType (FLAT | PERCENTAGE)
+          └── commissionValue
+```
+
+A `Campaign` covers one or more SKUs. Each `CampaignRule` defines the commission for a single SKU within that campaign.
+
+## Commission types
+
+**FLAT** — a fixed EUR amount paid per unit sold, regardless of sale price.
+
+```
+Rule: HASH-PK-1G → FLAT 0.50
+Sale: 2 units × HASH-PK-1G
+Commission: 2 × 0.50 = 1.00 EUR
+```
+
+**PERCENTAGE** — a fraction of the line item sale price.
+
+```
+Rule: WEED-STD-3G → PERCENTAGE 0.05
+Sale: 1 unit × WEED-STD-3G @ 22.00 EUR
+Commission: 22.00 × 0.05 = 1.10 EUR
+```
+
+## One active campaign per SKU
+
+Only one `ACTIVE` campaign may have a rule for any given SKU at a time. Attempting to create a campaign whose rules include a SKU that is already covered by an active campaign returns `409 Conflict`:
+
+```json
+{
+  "error": "SKU already has an active campaign",
+  "conflict": {
+    "skuId": "sku_abc",
+    "skuName": "Hash PK 1g",
+    "campaignId": "camp_xyz",
+    "campaignName": "Spring Promo"
+  }
+}
+```
+
+To run a new campaign on a SKU, pause or end the existing campaign first, then create the new one.
+
+## Campaign snapshot
+
+The resolved commission rates are written to `SaleEvent.campaignSnapshot` as JSON at the moment of ingestion. This is the rate that will be paid regardless of any future edits.
+
+```json
+{
+  "rules": [
+    {
+      "skuId": "sku_abc123",
+      "externalSku": "HASH-PK-1G",
+      "campaignRuleId": "rule_xyz",
+      "commissionType": "FLAT",
+      "commissionValue": "0.50",
+      "resolvedAmount": "1.00"
+    }
+  ],
+  "totalCommissionEurc": "2.10",
+  "snapshotAt": "2026-03-16T14:32:00.000Z"
+}
+```
+
+Editing a campaign after a sale has been ingested has zero effect on that sale's payout.
+
+## Zero-commission sales
+
+If a sale contains no SKUs with active campaign rules, `totalCommission = 0`. The `SaleEvent` is saved with `status = SKIPPED`. No payout is created.
+
+## Platform fee
+
+The platform fee (50 bps = 0.5%) is not part of the campaign calculation. It is applied by the payout worker when constructing the on-chain call:
+
+```
+budtender amount = totalCommission
+fee = totalCommission × 0.005
+vault debit = totalCommission + fee
+```
+
+The vault always holds enough to cover both. The fee is transferred directly to the Moongrow treasury on-chain.

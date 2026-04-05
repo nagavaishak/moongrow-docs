@@ -1,0 +1,139 @@
+---
+title: "Instructions"
+description: "Full parameter reference for all 8 Moongrow Anchor instructions"
+sidebarTitle: "Instructions"
+---
+
+## initialize_config
+
+One-time setup. Creates the global `Config` PDA. A second call fails because the PDA already exists.
+
+**Caller:** Deployer
+
+**Parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `treasury` | `Pubkey` | Wallet that receives platform fees |
+| `backend_signer` | `Pubkey` | Only this key can call `execute_payout` |
+| `fee_bps` | `u16` | Platform fee in basis points (50 = 0.5%) |
+| `max_payout_lamports` | `u64` | Maximum single payout size |
+
+**Accounts:** `admin`, `config` (init), `system_program`
+
+---
+
+## update_config
+
+Updates config parameters. Only the current `admin` can call this.
+
+**Caller:** Admin
+
+**Parameters** — same as `initialize_config`
+
+**Accounts:** `admin`, `config` (mut)
+
+---
+
+## initialize_store
+
+Creates a `StoreVault` PDA and its EURC token account for a new store. Called once per store by the retailer.
+
+**Caller:** Retailer
+
+**Parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `store_id` | `String` | Unique identifier for the store (matches DB `Store.id`) |
+
+**Accounts:** `retailer`, `config`, `store_vault` (init), `vault_token_account` (init), `eurc_mint`, `system_program`, `token_program`
+
+---
+
+## fund_store
+
+Transfers EURC from the retailer's token account to the vault token account, and optionally SOL to the vault PDA for gas.
+
+**Caller:** Retailer (must be `StoreVault.retailer`)
+
+**Parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `eurc_amount` | `u64` | EURC micro-units to deposit (1 EURC = 1_000_000) |
+| `sol_amount` | `u64` | Lamports to deposit for gas |
+
+**Accounts:** `retailer`, `store_vault`, `vault_token_account`, `retailer_token_account`, `token_program`, `system_program`
+
+---
+
+## execute_payout
+
+The core instruction. Splits a total amount between the budtender and the treasury, creates a permanent `PayoutRecord`, and PDA-signs both transfers.
+
+**Caller:** Backend signer only (verified against `Config.backend_signer`)
+
+**Parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `sale_event_id` | `String` | Unique sale ID from the POS. Seeds the PayoutRecord PDA. |
+| `amount` | `u64` | Total EURC micro-units to debit from vault (budtender + fee) |
+
+**Fee math (on-chain)**
+```rust
+let fee = amount * config.fee_bps as u64 / 10_000;
+let budtender_amount = amount - fee;
+```
+
+**Accounts:** `backend_signer`, `config`, `store_vault`, `vault_token_account`, `budtender_wallet`, `budtender_token_account` (init_if_needed), `treasury_token_account` (init_if_needed), `payout_record` (init), `eurc_mint`, `token_program`, `associated_token_program`, `system_program`
+
+**Checks:**
+- `backend_signer.key == config.backend_signer`
+- `!store_vault.is_frozen`
+- `amount <= config.max_payout_lamports`
+- `payout_record` PDA does not already exist (Solana account collision = double-pay impossible)
+
+---
+
+## withdraw
+
+Pulls EURC and/or SOL from the vault back to the retailer.
+
+**Caller:** Retailer (must be `StoreVault.retailer`)
+
+**Parameters**
+
+| Param | Type | Description |
+|---|---|---|
+| `eurc_amount` | `u64` | EURC micro-units to withdraw |
+| `sol_amount` | `u64` | Lamports to withdraw |
+
+**Checks:** `!store_vault.is_frozen`
+
+**Accounts:** `retailer`, `store_vault`, `vault_token_account`, `retailer_token_account`, `token_program`, `system_program`
+
+---
+
+## freeze_store
+
+Sets `StoreVault.is_frozen = true`. Prevents `execute_payout` and `withdraw` from executing.
+
+**Caller:** Admin only (`Config.admin`)
+
+**Parameters:** none
+
+**Accounts:** `admin`, `config`, `store_vault` (mut)
+
+---
+
+## unfreeze_store
+
+Sets `StoreVault.is_frozen = false`. Resumes payouts and withdrawals.
+
+**Caller:** Admin only (`Config.admin`)
+
+**Parameters:** none
+
+**Accounts:** `admin`, `config`, `store_vault` (mut)

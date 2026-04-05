@@ -1,0 +1,120 @@
+---
+title: "Payout Worker"
+description: "BullMQ worker that drives EURC transfers from store vaults to budtender wallets"
+---
+
+The payout worker is a BullMQ consumer that runs inside the API process. It picks up jobs created during POS ingestion and calls the Anchor program to execute on-chain transfers.
+
+## IDL requirement
+
+The worker loads the Anchor IDL from `dist/idl/moongrow.json` at runtime. The `tsc` compiler does not copy `.json` files, so the API `build` script handles this explicitly:
+
+```json
+"build": "tsc --outDir dist && cp -r src/idl dist/idl"
+```
+
+If the `dist/idl/` directory is missing after a build, the worker will throw a module-not-found error on startup. Ensure the build script includes the `cp` step — do not rely on `tsc` alone.
+
+## Queue configuration
+
+```typescript
+// packages/api/src/workers/payout-queue.ts
+export const payoutQueue = new Queue<PayoutJobData>(PAYOUT_JOB.QUEUE_NAME, {
+  connection,
+  defaultJobOptions: {
+    attempts: PAYOUT_JOB.MAX_ATTEMPTS,   // 5
+    backoff: { type: 'exponential', delay: PAYOUT_JOB.BACKOFF_DELAY_MS }, // 5s base
+  },
+})
+```
+
+Jobs are retried up to 5 times with exponential backoff (5s, 10s, 20s, 40s, 80s). This handles transient RPC failures and temporarily empty vaults.
+
+## Job payload
+
+```typescript
+interface PayoutJobData {
+  saleEventId: string
+  storeId: string
+  budtenderWallet: string   // Solana pubkey
+  amountEurc: number        // commission amount (excluding fee)
+  feeEurc: number           // platform fee
+}
+```
+
+## Execution flow
+
+```
+1. Mark PayoutRecord { status: SUBMITTED, attemptCount++ }
+2. Derive all PDAs from storeId + saleEventId + budtenderWallet
+3. Calculate totalLamports = (amountEurc + feeEurc) × 1_000_000
+4. Call program.methods.executePayout(saleEventId, BN(totalLamports))
+5. Write txHash + payoutPda to PayoutRecord
+6. Update SaleEvent { status: SENT }
+7. Decrement store.vaultEurc by totalEurc — alert Slack if balance < €100
+```
+
+Helius sends a transaction confirmation webhook that flips the status to `CONFIRMED`. The worker does not poll for finality.
+
+## PDA derivation
+
+```typescript
+const configPda      = deriveConfigPda(programId)
+const storeVaultPda  = deriveStoreVaultPda(storeId, programId)
+const vaultTokenPda  = deriveVaultTokenPda(storeId, programId)
+const payoutRecordPda = derivePayoutRecordPda(saleEventId, programId)
+const budtenderAta   = deriveAta(budtenderPubkey, eurcMint)
+const treasuryAta    = deriveAta(treasuryWallet, eurcMint)
+```
+
+All addresses are computed deterministically off-chain. No RPC calls are needed to find accounts.
+
+## EURC decimal math
+
+EURC has 6 decimal places. All amounts in the database are stored as EUR floats. The conversion:
+
+```typescript
+const totalLamports = Math.round((amountEurc + feeEurc) * 1_000_000)
+```
+
+`1.00 EURC = 1_000_000 lamports` (EURC micro-units, not SOL lamports).
+
+## Failure handling
+
+Each attempt is logged individually so you can trace failures without waiting for retries to exhaust:
+
+```
+[payout] attempt 1/5 FAILED | saleEventId=<id> error=<message>
+[payout] attempt 2/5 FAILED | saleEventId=<id> error=<message>
+...
+```
+
+This log line appears on every BullMQ retry, making it straightforward to tail Railway logs and spot transient vs. permanent failures in real time.
+
+When the worker exhausts all retry attempts:
+
+```typescript
+payoutWorker.on('failed', async (job, err) => {
+  if (job.attemptsMade < PAYOUT_JOB.MAX_ATTEMPTS) return
+
+  const record = await prisma.payoutRecord.update({
+    where: { saleEventId: job.data.saleEventId },
+    data: { status: 'FAILED', failureReason: err.message },
+  })
+  await prisma.saleEvent.update({
+    where: { id: job.data.saleEventId },
+    data: { status: 'FAILED' },
+  })
+  await alertPayoutFailed(record.id, job.data.saleEventId, err.message)
+})
+```
+
+Failed payouts are visible in the admin dashboard and require manual intervention.
+
+## Vault empty scenario
+
+If the vault has insufficient EURC, the Anchor program returns an error and the BullMQ job fails. It retries automatically. When the retailer tops up the vault, the next retry succeeds without any manual action.
+
+<Note>
+  The worker only processes one job at a time per queue. Concurrent payouts for different stores are safe because each store has its own vault PDA.
+</Note>

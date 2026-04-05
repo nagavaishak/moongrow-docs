@@ -1,0 +1,117 @@
+---
+title: "Quickstart"
+description: "Get the full Moongrow stack running locally in under 10 minutes"
+---
+
+## Prerequisites
+
+- Node.js 20+
+- pnpm 9+
+- Docker (for Postgres + Redis) or local instances
+- A Solana wallet with devnet SOL
+
+<Steps>
+  <Step title="Clone and install">
+    ```bash
+    git clone https://github.com/Moongrow-Technologies/Moongrow-BrandBudtender-Dashboards.git
+    cd Moongrow-BrandBudtender-Dashboards
+    pnpm install
+    ```
+  </Step>
+
+  <Step title="Configure environment">
+    ```bash
+    cp .env.example .env
+    ```
+
+    Edit `.env` and fill in the required values:
+
+    | Variable | Description |
+    |---|---|
+    | `DATABASE_URL` | PostgreSQL connection string |
+    | `DIRECT_URL` | Direct Postgres URL (for migrations) |
+    | `REDIS_URL` | Redis connection string |
+    | `NEXT_PUBLIC_PRIVY_APP_ID` | Privy app ID (from privy.io dashboard) |
+    | `PRIVY_APP_SECRET` | Privy app secret |
+    | `HELIUS_API_KEY` | Helius RPC API key |
+    | `HELIUS_RPC_URL` | Full Helius RPC URL |
+    | `HELIUS_WEBHOOK_SECRET` | Webhook signing secret from Helius dashboard |
+    | `BACKEND_SIGNER_PRIVATE_KEY` | Base58 private key of the backend signer keypair |
+    | `EURC_MINT_DEVNET` | EURC mint address on devnet |
+    | `MOONGROW_PROGRAM_ID` | `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK` |
+    | `MOONGROW_TREASURY_WALLET` | Solana pubkey for platform fee collection |
+  </Step>
+
+  <Step title="Start infrastructure">
+    ```bash
+    docker compose up -d
+    ```
+  </Step>
+
+  <Step title="Run migrations and seed">
+    ```bash
+    pnpm db:migrate
+    pnpm db:seed
+    ```
+
+    The seed script creates:
+    - 1 test store (Moongrow Pilot)
+    - 5 SKUs from a typical coffeeshop catalog
+    - 1 test budtender with an embedded wallet
+    - A POS API key and HMAC signing secret
+    - 2 active campaigns (flat-rate and percentage)
+  </Step>
+
+  <Step title="Start the dev server">
+    ```bash
+    pnpm dev
+    ```
+
+    This starts all apps and the API in parallel:
+
+    | App | URL |
+    |---|---|
+    | Retailer dashboard | `http://localhost:3000` |
+    | Budtender PWA | `http://localhost:3001` |
+    | Admin panel | `http://localhost:3002` |
+    | API server | `http://localhost:3100` |
+  </Step>
+
+  <Step title="Verify the API">
+    ```bash
+    curl http://localhost:3100/api/health
+    ```
+
+    Expected response:
+    ```json
+    {"status":"ok","postgres":"up","redis":"up"}
+    ```
+  </Step>
+
+  <Step title="Run the devnet smoke test">
+    This sends a real payout on Solana devnet end to end:
+
+    ```bash
+    HELIUS_RPC_URL=https://devnet.helius-rpc.com/?api-key=YOUR_KEY \
+    BACKEND_SIGNER_PRIVATE_KEY=YOUR_BASE58_KEY \
+    MOONGROW_TREASURY_WALLET=YOUR_TREASURY_PUBKEY \
+    npx tsx packages/api/scripts/test-devnet-payout.ts
+    ```
+
+    Expected output:
+    ```
+    Moongrow devnet smoke test
+    Program: Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK
+    ...
+    Budtender received: 0.995 EURC
+    Treasury received:  0.005 EURC
+
+    Transaction: https://explorer.solana.com/tx/...?cluster=devnet
+    Smoke test PASSED
+    ```
+  </Step>
+</Steps>
+
+<Card title="Understand the architecture" icon="sitemap" href="/architecture/overview">
+  See how all the pieces connect before diving deeper.
+</Card>

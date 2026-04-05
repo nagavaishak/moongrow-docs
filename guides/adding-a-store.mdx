@@ -1,0 +1,119 @@
+---
+title: "Adding a store"
+description: "End-to-end guide: onboard a new coffeeshop from zero to live payouts"
+---
+
+This guide walks through onboarding a new store from scratch. A "store" in Moongrow maps to a physical coffeeshop location.
+
+<Steps>
+  <Step title="Create the store in the retailer dashboard">
+    The retailer logs in to the retailer app at `http://localhost:3000` with Privy and connects their Solana wallet (Phantom, Backpack, etc.). This becomes `Store.ownerWallet`.
+
+    From the dashboard, create the store:
+    - Store name
+    - Physical address (optional)
+    - Locale (default: `nl` for Dutch)
+
+    This creates a `Store` record and a `StoreMembership` with `role = OWNER`.
+  </Step>
+
+  <Step title="Initialize the on-chain vault">
+    After the store is created, the retailer clicks **Initialize vault** in the dashboard.
+
+    This calls `initialize_store` on the Anchor program:
+
+    ```typescript
+    await program.methods
+      .initializeStore(storeId)
+      .accounts({
+        retailer: retailerPubkey,
+        config: configPda,
+        storeVault: storeVaultPda,
+        vaultTokenAccount: vaultTokenPda,
+        eurcMint,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc()
+    ```
+
+    The `vaultPda` is written back to `Store.vaultPda` in the database.
+  </Step>
+
+  <Step title="Fund the vault">
+    The retailer funds the vault with EURC and a small amount of SOL for gas and ATA rent.
+
+    **EUR → EURC conversion:** Use the BVNK integration in the retailer dashboard to convert EUR to EURC on-chain.
+
+    **Fund from dashboard:** Click **Fund vault**, enter the EURC amount. This calls `fund_store` client-side, signed by the retailer's wallet.
+
+    <Tip>
+      Minimum recommended: 100 EURC + 0.1 SOL. BullMQ retries automatically if the vault runs out mid-campaign.
+    </Tip>
+  </Step>
+
+  <Step title="Connect EB POS">
+    In the retailer dashboard, go to **Settings → POS connections**.
+
+    1. Select "EB (eb.nl)" as the POS partner
+    2. Click **Generate API key** — a new `PosApiKey` is created
+    3. Copy the raw API key (shown only once) and the HMAC signing secret
+    4. Configure these in the EB POS system backend
+
+    The EB POS will now send HMAC-signed webhooks to `/api/pos/events` on each sale.
+  </Step>
+
+  <Step title="Sync the SKU catalog">
+    Import the store's product catalog from EB:
+
+    ```bash
+    POST /api/stores/{storeId}/skus/sync
+    ```
+
+    This creates `SkuCatalogItem` records for each product. SKUs are matched by `externalSku` (POS-side identifier) on every incoming sale event.
+  </Step>
+
+  <Step title="Create a campaign">
+    In the retailer dashboard, go to **Campaigns → New campaign**.
+
+    Configure:
+    - Campaign name and description
+    - Budget in EURC
+    - Date range (optional)
+    - Per-SKU commission rules (FLAT or PERCENTAGE)
+
+    Once published (`status = ACTIVE`), the campaign is live for all new sales.
+  </Step>
+
+  <Step title="Invite budtenders">
+    In the dashboard, go to **Team → Invite member**.
+
+    1. Generate an invite link (256-bit token, 7-day expiry)
+    2. Share the link with the budtender
+    3. Budtender opens the budtender app, follows the link, and logs in with email
+    4. Privy creates an embedded Solana wallet automatically
+    5. A `StoreMembership` record is created
+
+    <Warning>
+      After the budtender joins, set their `posStaffRef` in Team settings to match their EB POS staff ID. Without this, sales from that staff ID will be saved as `SKIPPED` — no payout is sent.
+    </Warning>
+  </Step>
+
+  <Step title="Verify the first payout">
+    Trigger a test sale from the EB POS system. In the retailer dashboard you should see:
+
+    1. `SaleEvent` with `status = QUEUED`
+    2. `PayoutRecord` with `status = SUBMITTED`
+    3. After Helius confirms: both flip to `CONFIRMED`
+
+    The budtender should see their EURC balance update in the budtender app within seconds.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Sale shows `SKIPPED` | POS staff ID not mapped | Set `StoreMembership.posStaffRef` |
+| Sale shows `FAILED` | Vault empty or RPC error | Check `PayoutRecord.failureReason`, fund vault |
+| `execute_payout` fails frozen | Store is frozen | Check admin panel, call `unfreeze_store` |

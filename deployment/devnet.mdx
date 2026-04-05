@@ -1,0 +1,202 @@
+---
+title: "Devnet deployment"
+description: "Deploy and verify the Moongrow Anchor program on Solana devnet"
+---
+
+## Prerequisites
+
+- Anchor CLI 0.32: `avm install 0.32.0 && avm use 0.32.0`
+- Solana CLI: `sh -c "$(curl -sSfL https://release.solana.com/stable/install)"`
+- Two funded devnet keypairs (see below)
+
+## Keypairs
+
+Moongrow uses two separate keypairs on devnet:
+
+| Keypair | Path | Purpose |
+|---|---|---|
+| Upgrade authority | `~/.config/solana/id.json` | Signs program deployments and IDL uploads |
+| Oracle / fee payer | `~/.config/solana/oracle-keypair.json` | Default CLI fee payer |
+| Backend signer | `keys/backend-signer-devnet.json` | Authorised to call `execute_payout` |
+
+<Warning>
+  The `keys/` directory is gitignored. Never commit keypair files.
+</Warning>
+
+## Deploy
+
+<Steps>
+  <Step title="Fund the upgrade authority">
+    The upgrade authority needs SOL for the buffer account during deployment (~2.7 SOL for the current binary size).
+
+    ```bash
+    # Check balance
+    solana balance ~/.config/solana/id.json --url devnet
+
+    # Airdrop (up to 2 SOL per request)
+    solana airdrop 2 $(solana-keygen pubkey ~/.config/solana/id.json) --url devnet
+
+    # Or transfer from the oracle wallet
+    solana transfer $(solana-keygen pubkey ~/.config/solana/id.json) 1.0 --url devnet
+    ```
+  </Step>
+
+  <Step title="Build">
+    ```bash
+    anchor build
+    ```
+
+    Output binary: `target/deploy/moongrow.so`
+  </Step>
+
+  <Step title="Deploy">
+    ```bash
+    anchor deploy \
+      --program-name moongrow \
+      --provider.cluster devnet \
+      --upgrade-authority ~/.config/solana/id.json
+    ```
+
+    Note the deployed program ID in the output.
+  </Step>
+
+  <Step title="Update declare_id!">
+    Update both files to match the deployed program ID:
+
+    ```rust
+    // programs/moongrow/src/lib.rs
+    declare_id!("Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK");
+    ```
+
+    ```toml
+    # Anchor.toml
+    [programs.devnet]
+    moongrow = "Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK"
+    ```
+
+    Then rebuild: `anchor build`
+  </Step>
+
+  <Step title="Upload IDL on-chain">
+    ```bash
+    anchor idl init \
+      --filepath target/idl/moongrow.json \
+      --provider.cluster devnet \
+      Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK
+    ```
+  </Step>
+
+  <Step title="Copy IDL to API">
+    ```bash
+    cp target/idl/moongrow.json packages/api/src/idl/moongrow.json
+    ```
+
+    The API `build` script copies the IDL into `dist/` automatically:
+
+    ```json
+    "build": "tsc --outDir dist && cp -r src/idl dist/idl"
+    ```
+
+    `tsc` does not copy `.json` files — the explicit `cp` is required.
+  </Step>
+
+  <Step title="Initialize config PDA">
+    Run once after first deployment:
+
+    ```typescript
+    await program.methods
+      .initializeConfig(
+        treasuryWallet,
+        backendSignerPubkey,
+        50,                        // fee_bps: 0.5%
+        new BN(1_000_000_000_000), // max_payout: 1M EURC
+      )
+      .accounts({
+        admin: deployerPubkey,
+        config: configPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc()
+    ```
+  </Step>
+
+  <Step title="Initialize treasury and budtender ATAs">
+    The `execute_payout` instruction requires the treasury's EURC ATA and the budtender's EURC ATA to exist before the transaction is submitted. Run the initialization script once per environment:
+
+    ```bash
+    HELIUS_RPC_URL=https://devnet.helius-rpc.com/?api-key=YOUR_KEY \
+    BACKEND_SIGNER_PRIVATE_KEY=YOUR_BASE58_KEY \
+    MOONGROW_TREASURY_WALLET=YOUR_TREASURY_PUBKEY \
+    npx tsx packages/api/scripts/init-atas.ts
+    ```
+
+    The script derives the treasury ATA and a representative budtender ATA, creates them if they don't exist, and prints the addresses. Re-running is safe — it skips accounts that already exist.
+
+    <Warning>
+      Payouts will fail on-chain with an `AccountNotInitialized` error if the treasury ATA has not been created. Run `init-atas.ts` before the first payout on any new environment.
+    </Warning>
+  </Step>
+
+  <Step title="Run the smoke test">
+    ```bash
+    HELIUS_RPC_URL=https://devnet.helius-rpc.com/?api-key=YOUR_KEY \
+    BACKEND_SIGNER_PRIVATE_KEY=YOUR_BASE58_KEY \
+    MOONGROW_TREASURY_WALLET=YOUR_TREASURY_PUBKEY \
+    npx tsx packages/api/scripts/test-devnet-payout.ts
+    ```
+
+    A passing run prints the Solana Explorer link for the payout transaction.
+
+    The full E2E pipeline (POS → BullMQ → `execute_payout` on-chain → Helius webhook → `CONFIRMED`) has been verified on devnet. Reference transaction:
+    [`5ZcNwW91eV2e9iDfmBTa4Ej1ytm9nVk9LkZ95TmwQX83YvgLy4iv8QGdN82vEkB4q9pWoZ2jzy7W2MBRXawfW1va`](https://explorer.solana.com/tx/5ZcNwW91eV2e9iDfmBTa4Ej1ytm9nVk9LkZ95TmwQX83YvgLy4iv8QGdN82vEkB4q9pWoZ2jzy7W2MBRXawfW1va?cluster=devnet)
+  </Step>
+</Steps>
+
+## Environment variables
+
+Add to `.env`:
+
+```env
+SOLANA_CLUSTER=devnet
+HELIUS_RPC_URL=https://devnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
+BACKEND_SIGNER_PRIVATE_KEY=<base58 private key>
+EURC_MINT_DEVNET=524x7Z7tvLYJcd3AAXPdHvJwKYTXz158o6eZR8LhLLV7
+MOONGROW_PROGRAM_ID=Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK
+MOONGROW_TREASURY_WALLET=<your treasury pubkey>
+```
+
+## Verify on Explorer
+
+```
+https://explorer.solana.com/address/Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK?cluster=devnet
+```
+
+---
+
+## Monitoring setup
+
+These are configured once per environment after deployment.
+
+### Helius webhook
+
+| Field | Value |
+|---|---|
+| Webhook ID | `83244c73-2023-454a-be5d-490488a4651a` |
+| Network | devnet |
+| Account watched | `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK` |
+| Current webhook URL | Your public API URL + `/api/webhooks/helius` — set in Helius dashboard. Use ngrok locally (`ngrok http 3100`). |
+
+The webhook fires on every transaction involving the Moongrow program, allowing the API to flip `PayoutRecord` status from `SUBMITTED` → `CONFIRMED` or `FAILED`.
+
+See [Alerts & Monitoring](/monitoring/alerts) for full setup instructions.
+
+### Slack alerts
+
+Slack incoming webhook is configured and active. Alerts fire for:
+- Payout failures (on-chain or max retries)
+- Low vault balance (below €100)
+- POS ingestion errors
+- Unknown budtenders
+- Store freeze events
+
+Add `SLACK_WEBHOOK_URL` to `.env` to enable. Falls back to `console.log` if not set.

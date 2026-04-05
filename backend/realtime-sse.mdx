@@ -1,0 +1,111 @@
+---
+title: "Real-Time SSE"
+description: "Server-Sent Events for live wallet, leaderboard, and commission updates"
+---
+
+Moongrow uses Server-Sent Events (SSE) to push updates to all three frontends without polling. SSE was chosen over WebSockets because it works reliably through Railway's load balancer proxy with no library overhead.
+
+## Architecture
+
+```
+Payout confirmed (Helius webhook)
+  → emit commission_settled    → budtender app updates balance
+  → emit wallet_update         → retailer dashboard updates wallet
+  → emit leaderboard_update    → both apps refresh rankings
+
+Bonus lifecycle worker (every 60s)
+  → emit bonus_update          → retailer + budtender apps refresh competition card
+
+Campaign pause/resume
+  → emit campaign_status       → all connected clients for that store
+```
+
+Two SSE endpoints exist — one per audience:
+
+| Endpoint | Audience | Auth |
+|---|---|---|
+| `GET /api/realtime/store/:storeId` | Retailer dashboard | `Authorization: Bearer <privy-jwt>` |
+| `GET /api/realtime/budtender` | Budtender PWA | `?token=<privy-jwt>` query param |
+
+The budtender endpoint accepts the token as a query param because `EventSource` does not support custom headers in the browser.
+
+## Event types
+
+### Retailer events
+
+| Event | When | Payload |
+|---|---|---|
+| `wallet_update` | Commission settles or top-up confirmed | `{ total, committedCampaigns, committedBonuses, available, lowBalanceWarning }` |
+| `leaderboard_update` | Any commission settles for this store | Updated leaderboard entries |
+| `campaign_status` | Campaign paused or resumed | `{ campaignId, status }` |
+| `bonus_update` | Bonus starts, ends, or leaderboard changes | `{ bonusId, status, leaderboard? }` |
+
+### Budtender events
+
+| Event | When | Payload |
+|---|---|---|
+| `commission_settled` | A sale attributed to this budtender is confirmed | `{ amount, skuName, newBalance }` |
+| `leaderboard_update` | Any commission settles at the budtender's store | Updated rankings with `userRank` + `userGap` |
+| `campaign_status` | Campaign paused or resumed at their store | `{ campaignId, status }` |
+
+## Frontend hook
+
+Both the retailer and budtender apps use the `useSSE` hook from `apps/budtender/src/lib/sse-client.ts` (budtender) and a shared equivalent in `packages/shared/src/sse-client.ts`.
+
+```typescript
+import { useSSE } from '@/lib/sse-client'
+
+const sseEvent = useSSE(sseUrl, privyToken)
+
+useEffect(() => {
+  if (sseEvent?.type === 'commission_settled') {
+    queryClient.invalidateQueries({ queryKey: ['earnings'] })
+  }
+  if (sseEvent?.type === 'leaderboard_update') {
+    queryClient.invalidateQueries({ queryKey: ['leaderboard'] })
+  }
+}, [sseEvent])
+```
+
+The hook:
+- Connects on mount, disconnects on unmount
+- Reconnects automatically with exponential backoff (1s → 2s → 4s → ... → 30s max) on error
+- Resets backoff to 1s on successful reconnect
+- Handles all 5 event types: `wallet_update`, `leaderboard_update`, `campaign_status`, `bonus_update`, `commission_settled`
+
+## Railway proxy requirements
+
+SSE connections require two things to stay alive through Railway's load balancer:
+
+1. **`X-Accel-Buffering: no`** response header — disables Nginx response buffering
+2. **Heartbeat every 30 seconds** — sends `: heartbeat\n\n` comment to prevent Railway from closing idle connections
+
+Both are set automatically by `packages/api/src/routes/realtime.ts`. Do not remove them.
+
+```typescript
+res.setHeader('Content-Type', 'text/event-stream')
+res.setHeader('Cache-Control', 'no-cache')
+res.setHeader('X-Accel-Buffering', 'no')
+res.flushHeaders()
+
+// Heartbeat
+const heartbeat = setInterval(() => {
+  res.write(': heartbeat\n\n')
+}, 30_000)
+
+req.on('close', () => {
+  clearInterval(heartbeat)
+  // remove client from store's subscriber set
+})
+```
+
+## Emit points
+
+| Source | Events emitted |
+|---|---|
+| `POST /api/webhooks/helius` (CONFIRMED) | `commission_settled`, `wallet_update`, `leaderboard_update` |
+| `POST /api/webhooks/confirmo` (top-up confirmed) | `wallet_update` |
+| `bonus-lifecycle` worker (bonus ACTIVE / COMPLETED) | `bonus_update` |
+| `POST /api/campaigns/:id/pause` | `campaign_status` |
+| `POST /api/campaigns/:id/resume` | `campaign_status` |
+| Auto-pause after payout (balance → 0) | `campaign_status` |

@@ -1,0 +1,99 @@
+---
+title: "Privy Auth"
+description: "How Moongrow uses Privy for wallet creation and authentication across all three apps"
+---
+
+Moongrow uses [Privy](https://privy.io) as the auth and wallet layer. It handles two different use cases depending on the user type.
+
+## User types and wallet strategy
+
+| User | Auth method | Wallet type |
+|---|---|---|
+| Budtender | Email or social login | Embedded wallet (Privy-generated, non-custodial) |
+| Retailer | Email or social login | BYOW — bring your own wallet (Phantom, Backpack, etc.) |
+| Admin | Email login | Embedded wallet |
+
+### Budtender embedded wallets
+
+Budtenders do not need a crypto wallet app. When they log in with their email for the first time, Privy automatically creates a Solana embedded wallet for them.
+
+The wallet address is stored in `User.walletAddress`. This is the address the payout worker uses as `budtenderWallet` when calling `execute_payout`.
+
+Budtenders never see private keys. Privy's key sharding (MPC) means neither Privy nor Moongrow has the full key.
+
+### Retailer BYOW
+
+Retailers connect an existing Solana wallet (Phantom, Backpack, Solflare). This wallet:
+- Is stored as `Store.ownerWallet`
+- Is the `retailer` authority on the `StoreVault` PDA
+- Signs `fund_store` and `withdraw` transactions client-side
+
+Retailers control their funds at all times. Moongrow cannot move EURC out of a retailer's vault.
+
+## Configuration
+
+```env
+NEXT_PUBLIC_PRIVY_APP_ID=your_privy_app_id
+PRIVY_APP_SECRET=your_privy_app_secret
+```
+
+Both values come from the [Privy dashboard](https://dashboard.privy.io).
+
+`NEXT_PUBLIC_PRIVY_APP_ID` is exposed to the browser. `PRIVY_APP_SECRET` is server-side only — never expose this to the client.
+
+## Implementation
+
+Each frontend wraps the app with Privy's `PrivyProvider`:
+
+```tsx
+// apps/retailer/app/providers.tsx
+import { PrivyProvider } from '@privy-io/react-auth'
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <PrivyProvider
+      appId={process.env.NEXT_PUBLIC_PRIVY_APP_ID!}
+      config={{
+        loginMethods: ['email', 'wallet'],
+        embeddedWallets: {
+          createOnLogin: 'users-without-wallets',
+        },
+        defaultChain: solana,
+        supportedChains: [solana],
+      }}
+    >
+      {children}
+    </PrivyProvider>
+  )
+}
+```
+
+The retailer app enables wallet connection login methods. The budtender app creates embedded wallets on login.
+
+## Server-side verification
+
+API routes that require auth verify the Privy JWT:
+
+```typescript
+import { PrivyClient } from '@privy-io/server-auth'
+
+const privy = new PrivyClient(
+  process.env.NEXT_PUBLIC_PRIVY_APP_ID!,
+  process.env.PRIVY_APP_SECRET!,
+)
+
+const claims = await privy.verifyAuthToken(authToken)
+// claims.userId = the Privy DID stored in User.privyId
+```
+
+## Wallet sync
+
+When a user logs in for the first time, the frontend syncs the wallet address to the API:
+
+```
+POST /api/users/sync
+{ privyId, walletAddress, email }
+→ Upsert User record
+```
+
+This keeps `User.walletAddress` current even if the user creates a new embedded wallet.

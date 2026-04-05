@@ -1,0 +1,99 @@
+---
+title: "Bonus System"
+description: "Ranked competitions with auto-settled prize payouts for budtenders"
+---
+
+The bonus system lets retailers run time-bounded competitions with EURC prizes. Budget is earmarked from the store wallet on creation and settled automatically when the competition ends.
+
+## Bonus types
+
+| Type | Description |
+|---|---|
+| `RANKED` | Top N budtenders by metric win positional prizes |
+| `THRESHOLD` | Any budtender who hits a target value wins a flat prize |
+| `SPRINT` | First budtender to reach the target wins |
+
+## Ranking metrics
+
+| Metric | Measures |
+|---|---|
+| `COMMISSION_AMOUNT` | Total confirmed EURC earned in the bonus window |
+| `UNITS_SOLD` | Units sold of a specific SKU (`skuId` required) |
+
+## Scope
+
+| Scope | Behaviour |
+|---|---|
+| `STORE` | Only budtenders at the owning store compete |
+| `CHAIN` | Budtenders across all stores in `storeIds` compete |
+
+Chain-wide bonuses show the budtender's store name alongside their rank in the leaderboard.
+
+## Budget earmarking
+
+```
+POST /api/bonuses  →  Store.committedBonuses += budgetTotal
+DELETE /api/bonuses/:id  →  Store.committedBonuses -= budgetTotal (full release)
+Bonus COMPLETED  →  Store.committedBonuses -= budgetSpent (partial release)
+```
+
+The wallet balance breakdown (`GET /api/stores/:id/wallet`) always reflects committed bonuses in real time.
+
+## Lifecycle
+
+```
+SCHEDULED  ──(startsAt reached)──►  ACTIVE
+   │                                   │
+   └──(DELETE /api/bonuses/:id)──►  CANCELLED
+                                       │
+                               (endsAt reached)
+                                       │
+                                       ▼
+                                   COMPLETED
+                                  (prizes settled)
+```
+
+A BullMQ job (`bonus-lifecycle`) runs every minute:
+1. `SCHEDULED` bonuses where `startsAt ≤ now` → `ACTIVE`
+2. `ACTIVE` bonuses where `endsAt ≤ now` → `COMPLETED` → trigger prize settlement
+
+## Prize settlement
+
+When a bonus moves to `COMPLETED`:
+
+1. Query all qualifying `PayoutRecord` or `SaleEventLineItem` records within the bonus window
+2. Rank budtenders by the metric
+3. Apply `tieRule`:
+   - `SPLIT` — tied budtenders share the combined prize for their positions
+   - `ALL_REWARDED` — all tied budtenders receive the full prize for that position
+4. Create `BonusPayout` records for each winner
+5. Queue BullMQ jobs to execute on-chain EURC transfers (same `execute_payout` flow as regular commissions)
+6. Write `BONUS_PAID` `WalletTransaction` entries
+7. Release unused budget: `budgetTotal - budgetSpent` back to available balance
+8. Emit `bonus_update` SSE event
+
+## Leaderboard
+
+`GET /api/bonuses/:id/leaderboard` returns a live snapshot during the competition:
+
+```json
+{
+  "entries": [
+    { "rank": 1, "userId": "...", "displayName": "Maya", "value": 24.50, "gap": 0 },
+    { "rank": 2, "userId": "...", "displayName": "Tom",  "value": 18.00, "gap": 6.50 }
+  ]
+}
+```
+
+`gap` is the difference to the person directly above.
+
+The budtender leaderboard endpoint (`GET /api/budtender/leaderboard?storeId=`) automatically returns the active bonus leaderboard when one exists, falling back to the default weekly leaderboard otherwise.
+
+## Tie rule example
+
+Two budtenders tie for 2nd place in a `RANKED` bonus with prize structure `[1st: €100, 2nd: €50, 3rd: €25]`:
+
+| `tieRule` | Result |
+|---|---|
+| `SPLIT` | Both receive €25 (the 2nd+3rd prizes combined, split evenly) |
+| `ALL_REWARDED` | Both receive €50 (both get the full 2nd place prize) |

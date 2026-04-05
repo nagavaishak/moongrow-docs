@@ -1,0 +1,76 @@
+---
+title: "Confirmo"
+description: "EUR → EURC on-ramp integration — how retailers fund their Solana vault"
+---
+
+## Overview
+
+Moongrow uses [Confirmo](https://confirmo.net) as the EUR → EURC on-ramp bridge. When a retailer wants to fund their vault, the API creates a Confirmo invoice denominated in EUR. Confirmo handles the fiat payment and settles EURC **directly to the vault's SPL token account** on Solana — no manual transfer step needed.
+
+The off-ramp direction (EURC → EUR for budtender payouts) is stubbed and not yet active. It will be enabled once the budtender KYC flow with Confirmo is implemented.
+
+---
+
+## On-ramp flow
+
+```
+Retailer clicks "Deposit" in the wallet page
+  → POST /api/stores/:id/funding-invoice { amountEur: "100.00" }
+  → API derives vault SPL token account address (deriveVaultTokenPda)
+  → POST https://confirmo.net/api/v3/invoices
+      { invoice: { amount, currencyFrom: "EUR" },
+        settlement: { currency: "EURC", address: <vault_token_pda> },
+        notifyUrl: /api/webhooks/confirmo,
+        reference: storeId }
+  → API returns { invoiceId, url, status }
+  → Frontend opens Confirmo payment URL in a new tab
+  → Retailer completes EUR payment on Confirmo
+  → Confirmo settles EURC on-chain to vault token account
+  → Confirmo calls POST /api/webhooks/confirmo
+  → Webhook verifies bp-signature, checks status === "paid"
+  → DB: Store.vaultEurc incremented, AuditLog entry created
+```
+
+---
+
+## Webhook security
+
+Confirmo authenticates webhook calls with a `bp-signature` header — an HMAC-SHA256 of the raw request body keyed with your `CONFIRMO_CALLBACK_PASSWORD`.
+
+The handler at `POST /api/webhooks/confirmo`:
+1. Reads the raw request body (attached by the `express.json` verify callback as `req.rawBody`).
+2. Computes `HMAC-SHA256(rawBody, CONFIRMO_CALLBACK_PASSWORD)`.
+3. Uses `crypto.timingSafeEqual` to compare — prevents timing attacks.
+4. Returns `200` immediately before any DB work (Confirmo retries on non-2xx responses).
+
+If `CONFIRMO_CALLBACK_PASSWORD` is not set, signature verification is skipped (useful for local development).
+
+---
+
+## Settlement address
+
+`settlement.address` must be an **initialized SPL token account** — not a regular Solana wallet address. The API derives this via `deriveVaultTokenPda(storeId, programId)`, which is a PDA seeded with `["vault-token", storeId]`.
+
+The `fund_store` Anchor instruction is **not** called from the API server. That instruction requires `retailer: Signer`, which the server cannot provide. Confirmo delivers EURC on-chain directly; the webhook only syncs the `Store.vaultEurc` DB cache.
+
+---
+
+## Required environment variables
+
+| Variable | Description |
+|---|---|
+| `CONFIRMO_API_KEY` | Bearer token from your confirmo.net dashboard |
+| `CONFIRMO_CALLBACK_PASSWORD` | Used to verify `bp-signature` on incoming webhooks |
+| `CONFIRMO_API_URL` | API base URL — override to `https://sandbox.confirmo.net/api/v3` for testing |
+
+---
+
+## Off-ramp (stub)
+
+`createPayoutRequest` in `packages/api/src/services/confirmo.ts` is exported but always throws. It will be wired once:
+
+- Budtender KYC is integrated with Confirmo
+- `CONFIRMO_PAYOUT_METHOD_ID` is configured
+- The off-ramp route and frontend flow are built
+
+Do not call this function in production until those prerequisites are met.

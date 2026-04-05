@@ -1,0 +1,97 @@
+---
+title: "Smart contract overview"
+description: "The Moongrow Anchor program — non-custodial EURC vaults and atomic commission payouts"
+---
+
+The Moongrow Anchor program is the on-chain settlement layer. It holds retailer funds in per-store vaults and executes commission payouts in a single atomic transaction.
+
+## Program identity
+
+| Field | Value |
+|---|---|
+| Program ID | `Hpk6mnLt3AY5arziAte3km5gs1xiRur6jFs1jYdPTTpK` |
+| Framework | Anchor 0.32 (Rust) |
+| Network | Solana devnet (mainnet-beta for production) |
+| Token | EURC (Circle euro stablecoin, 6 decimals) |
+
+## Account architecture
+
+The program manages three types of PDAs:
+
+### Config PDA
+Seed: `["moongrow-config"]`
+
+Global settings initialized once by the deployer. Stores the treasury wallet, the authorized backend signer pubkey, the platform fee in basis points, and a maximum payout cap.
+
+```rust
+pub struct Config {
+    pub admin: Pubkey,
+    pub treasury: Pubkey,
+    pub backend_signer: Pubkey,
+    pub fee_bps: u16,        // 50 = 0.5%
+    pub max_payout_lamports: u64,
+    pub bump: u8,
+}
+```
+
+### Store Vault PDA
+Seeds: `["store-vault", store_id]`
+
+One per store. Holds the retailer's EURC balance (via an associated token account) and SOL for gas. Owned by the program — only the program can authorize outgoing transfers.
+
+```rust
+pub struct StoreVault {
+    pub store_id: String,
+    pub retailer: Pubkey,
+    pub eurc_mint: Pubkey,
+    pub is_frozen: bool,
+    pub bump: u8,
+    pub token_bump: u8,
+}
+```
+
+### Payout Record PDA
+Seeds: `["payout", sale_event_id]`
+
+Created by `execute_payout`. The fact that this account exists is the double-pay guard — a second call with the same `sale_event_id` fails with a Solana account collision before any logic executes.
+
+```rust
+pub struct PayoutRecord {
+    pub sale_event_id: String,
+    pub budtender: Pubkey,
+    pub amount: u64,
+    pub fee: u64,
+    pub bump: u8,
+}
+```
+
+## Security model
+
+**Backend signer authority** — only the pubkey registered in `Config.backend_signer` can call `execute_payout`. This is the `BACKEND_SIGNER_PRIVATE_KEY` held exclusively by the API server.
+
+**Retailer authority** — only `StoreVault.retailer` can call `fund_store` and `withdraw`.
+
+**Admin authority** — only `Config.admin` can call `freeze_store` and `unfreeze_store`.
+
+**Frozen guard** — `execute_payout` and `withdraw` both check `!store_vault.is_frozen` before proceeding.
+
+See [Security](/smart-contract/security) for a full analysis.
+
+## Instructions
+
+The program exposes 8 instructions:
+
+| Instruction | Caller | Description |
+|---|---|---|
+| `initialize_config` | Deployer | One-time global setup |
+| `update_config` | Admin | Update fee, treasury, signer |
+| `initialize_store` | Retailer | Create vault PDA for a store |
+| `fund_store` | Retailer | Deposit EURC + SOL to vault |
+| `execute_payout` | Backend signer | Pay budtender + treasury from vault |
+| `withdraw` | Retailer | Pull EURC + SOL back from vault |
+| `freeze_store` | Admin | Halt all payouts and withdrawals |
+| `unfreeze_store` | Admin | Resume payouts and withdrawals |
+
+<Card title="Instruction reference" icon="code" href="/smart-contract/instructions">
+  Full parameter docs for every instruction
+</Card>
